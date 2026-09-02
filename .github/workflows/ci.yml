@@ -8,6 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  COVERAGE_FLOOR: 95
 
 jobs:
   test:
@@ -22,3 +23,22 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+
+  coverage:
+    name: coverage >= 95%
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # --fail-under-lines is the gate. Keep it in CI rather than in a local
+      # script: this is the number that decides whether a change is finished.
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines ${{ env.COVERAGE_FLOOR }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lcov
+          path: lcov.info

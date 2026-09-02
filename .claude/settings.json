@@ -1,0 +1,65 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git stash:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(sort:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo llvm-cov:*)",
+      "Bash(rustup show)",
+      "Bash(rustup toolchain list)"
+    ],
+    "deny": [
+      "Read(**/.env)",
+      "Edit(**/.env)",
+      "Write(**/.env)",
+      "Read(**/.ssh/**)",
+      "Edit(**/.ssh/**)",
+      "Write(**/.ssh/**)",
+      "Read(**/.gnupg/**)",
+      "Edit(**/.gnupg/**)",
+      "Write(**/.gnupg/**)",
+      "Read(/etc/**)",
+      "Edit(/etc/**)",
+      "Write(/etc/**)",
+      "Read(/root/**)",
+      "Edit(/root/**)",
+      "Write(/root/**)",
+      "Read(**/*.key)",
+      "Read(**/signing/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+        { "type": "command", "command": "bash .claude/hooks/pre-bash-guard.sh" },
+        { "type": "command", "command": "bash .claude/hooks/filter-test-output.sh" }
+        ]
+      }
+    ]
+  }
+}

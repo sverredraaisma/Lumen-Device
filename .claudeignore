@@ -1,0 +1,10 @@
+# Build output — large, generated, never worth reading.
+/target
+**/target
+# Coverage artefacts
+/lcov.info
+/coverage
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
