@@ -20,6 +20,8 @@
 //!   a shared secret alone would let any paired device forge a scene.
 //! - [`channels`] — the broadcast uniforms an effect reads, with claim-and-lease
 //!   ownership and a defined decay when a producer dies.
+//! - [`render`] — the render loop, where the stack, the zones and the VM meet
+//!   and a pixel finally gets a colour.
 //!
 //! # What is not
 //!
@@ -36,6 +38,7 @@ pub mod channels;
 pub mod election;
 pub mod node;
 pub mod records;
+pub mod render;
 pub mod sources;
 pub mod sync;
 pub mod zones;
@@ -46,6 +49,7 @@ pub use channels::{Channel, Channels};
 pub use election::{Candidacy, Election, Role};
 pub use node::Node;
 pub use records::{Authority, Hlc, Record, RecordType, Store};
+pub use render::{Renderer, Rgb};
 pub use sources::{Source, SourceStack};
 pub use sync::{Sync, SyncState};
 pub use zones::{MapQuality, Projection, Zone};

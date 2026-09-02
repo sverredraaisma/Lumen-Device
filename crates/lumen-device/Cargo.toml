@@ -16,3 +16,8 @@ lumen-proto = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-prot
 # Zone predicates and the render loop both work in Q16 and run bytecode, so the
 # VM is a dependency of the device rather than only of the shell around it.
 lumen-vm = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-vm", default-features = false }
+
+[dev-dependencies]
+# The render tests assemble programs, which needs the VM builder that firmware
+# builds turn off.
+lumen-vm = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-vm" }
