@@ -7,8 +7,13 @@ name = "lumen-device"
 version = "0.1.0"
 
 [[package]]
+name = "lumen-hal"
+version = "0.1.0"
+
+[[package]]
 name = "lumen-sim"
 version = "0.1.0"
 dependencies = [
  "lumen-device",
+ "lumen-hal",
 ]

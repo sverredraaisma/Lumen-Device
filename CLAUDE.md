@@ -7,13 +7,16 @@ meshes with no hardware.
 - **Licence:** GPL-3.0. This is the "how to be part of the mesh" side of the
   boundary; the permissive side is `lumen-core`.
 - **Main branch:** `main`
-- **Status:** skeleton. W5/W6/W7 build the state machines, W8 the harness.
+- **Status:** W8 (the simulator) done; W5/W6/W7 still owe the state machines.
 
 ## Stack
 
 - Rust 1.85+, edition 2021
 - `lumen-device`: sans-IO state machines, no async runtime, no threads
 - `lumen-sim`: simulated HAL over a simulated clock and network, plus replay
+- No third-party dependencies anywhere in the workspace — the PRNG, the text
+  recording format and the JSON vector writer are all hand-rolled, because a
+  recorded run has to still reproduce after a `cargo update`
 
 ## Commands
 
@@ -75,6 +78,15 @@ Full list of what that bans, and why it is worth the friction:
   `/usr/bin/link` also shadows it even when it is installed.
 - **The render clock never steps.** Disciplining it means slewing. A step is a
   visible glitch, and the wall clock is a separate, optional concern.
+- **`lumen-hal` is a path dependency on a sibling checkout**, not a crates.io
+  version — nothing is published yet. `../lumen-core/crates/lumen-hal` must
+  exist, which is what `lumen-dev/scripts/clone-all.sh` arranges; CI checks the
+  sibling out by hand. Both revert to a plain version dep at the first
+  `lumen-core` release, and both are marked `TODO(release)`.
+- **Nothing may iterate a `HashMap` in `lumen-sim`.** Delivery order to a
+  multicast group, the order nodes are stepped in, the order storage enumerates:
+  all of them are observable, so all of them use `BTreeMap`/`BTreeSet` or an
+  explicit sort. This is what "same seed, same run" is actually made of.
 
 ## Specialized guides (loaded on demand — do not preload)
 

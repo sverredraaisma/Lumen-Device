@@ -10,3 +10,4 @@ authors.workspace = true
 
 [dependencies]
 lumen-device = { workspace = true }
+lumen-hal = { workspace = true }

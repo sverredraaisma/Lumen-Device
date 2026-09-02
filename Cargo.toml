@@ -12,3 +12,24 @@ authors = ["The Lumen contributors"]
 
 [workspace.dependencies]
 lumen-device = { version = "0.1.0", path = "crates/lumen-device" }
+
+# Interim: a path dependency on the sibling `lumen-core` checkout.
+#
+# `lumen-hal` is the trait set every simulated device implements, and it lives
+# in the permissive repo on purpose — a third-party shell must be able to
+# implement it without touching GPL code. Nothing is published to crates.io yet
+# and there is no git remote to point at, so a path is the only honest option:
+# a git dependency would need a URL that does not exist, and vendoring the
+# traits would fork the one definition the whole system agrees on.
+#
+# The path is what `lumen-dev/scripts/clone-all.sh` lays out: every repo checked
+# out side by side under one root, so `../lumen-core` resolves. CI checks the
+# sibling out explicitly (see .github/workflows/ci.yml) because a bare
+# actions/checkout only gets this repo.
+#
+# TODO(release): at the first `lumen-core` release this becomes a plain
+# `lumen-hal = "0.1"` crates.io dependency and the CI checkout step and the
+# clone-all coupling both go away. Until then a `lumen-hal` change lands in
+# lumen-core and is picked up here with no version bump, which is convenient
+# while the traits are still moving and a hazard once they are not.
+lumen-hal = { version = "0.1.0", path = "../lumen-core/crates/lumen-hal" }
