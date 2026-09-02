@@ -263,6 +263,15 @@ impl Sync {
             SyncState::Syncing => TICK_PERIOD_US,
             SyncState::Unsynced => TICK_PERIOD_US,
         };
+        // The tick-loss deadline only matters while there is sync to lose. Once
+        // Unsynced it is permanently in the past, so folding it in would return
+        // zero for ever - and a shell honouring that busy-polls at whatever rate
+        // its loop allows, which on a battery-powered sensor node is the
+        // difference between weeks and days. The way out of Unsynced is a TICK
+        // arriving as an event, not a timer firing.
+        if self.state == SyncState::Unsynced {
+            return resync;
+        }
         match self.last_tick_us {
             Some(last) => {
                 let deadline = last.saturating_add(TICK_PERIOD_US * MISSED_TICKS_ALLOWED as u64);
@@ -517,6 +526,26 @@ mod tests {
         }
         assert_eq!(s.on_sample(99, sample(99, 200, 0)), Outcome::Acquired);
         assert!(s.is_synced());
+    }
+
+    #[test]
+    fn an_unsynced_node_does_not_busy_poll() {
+        // Found by the conformance work. The tick-loss deadline is permanently
+        // in the past once sync is gone, so folding it in returned zero for
+        // ever and the node asked to be woken as fast as its shell allowed -
+        // which is exactly what `next_deadline_us` exists to prevent.
+        let mut s = synced();
+        s.on_timer(3 * TICK_PERIOD_US);
+        assert_eq!(s.state(), SyncState::Unsynced);
+        for step in 3..60u64 {
+            let now = step * TICK_PERIOD_US;
+            s.on_timer(now);
+            assert!(
+                s.next_deadline_us(now) >= TICK_PERIOD_US / 2,
+                "asked to be woken in {}us at {now}",
+                s.next_deadline_us(now)
+            );
+        }
     }
 
     #[test]
