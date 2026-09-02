@@ -13,3 +13,6 @@ authors.workspace = true
 # remote. This is the layout lumen-dev/scripts/clone-all.sh produces.
 # TODO(release): becomes `lumen-proto = "0.1"` at the first lumen-core release.
 lumen-proto = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-proto" }
+# Zone predicates and the render loop both work in Q16 and run bytecode, so the
+# VM is a dependency of the device rather than only of the shell around it.
+lumen-vm = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-vm", default-features = false }

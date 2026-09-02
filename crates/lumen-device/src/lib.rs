@@ -13,6 +13,8 @@
 //! - [`Node`] — the two together, decoding datagrams and emitting them.
 //! - [`sources`] — the source stack. One mechanism for shows, schedules,
 //!   alerts, manual control and streams, with priority and expiry on every one.
+//! - [`zones`] — zone selectors and projections, evaluated on each device
+//!   against its own LEDs so a zone never has to be resolved centrally.
 //!
 //! # What is not
 //!
@@ -23,10 +25,13 @@
 
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 pub mod election;
 pub mod node;
 pub mod sources;
 pub mod sync;
+pub mod zones;
 
 use lumen_proto::Uuid;
 
@@ -34,6 +39,7 @@ pub use election::{Candidacy, Election, Role};
 pub use node::Node;
 pub use sources::{Source, SourceStack};
 pub use sync::{Sync, SyncState};
+pub use zones::{MapQuality, Projection, Zone};
 
 /// Microseconds on the show clock.
 pub type ShowTimeUs = u64;
