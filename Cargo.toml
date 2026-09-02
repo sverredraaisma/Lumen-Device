@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/lumen-device", "crates/lumen-sim"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/REPLACE-ME/lumen-device"
+rust-version = "1.85"
+authors = ["The Lumen contributors"]
+
+[workspace.dependencies]
+lumen-device = { version = "0.1.0", path = "crates/lumen-device" }

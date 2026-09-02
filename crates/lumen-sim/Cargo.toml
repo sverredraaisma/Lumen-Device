@@ -1,0 +1,12 @@
+[package]
+name = "lumen-sim"
+description = "Simulated HAL, whole-mesh scenario harness and deterministic replay for Lumen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+lumen-device = { workspace = true }
