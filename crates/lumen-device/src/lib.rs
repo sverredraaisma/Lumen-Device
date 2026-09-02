@@ -15,6 +15,9 @@
 //!   alerts, manual control and streams, with priority and expiry on every one.
 //! - [`zones`] — zone selectors and projections, evaluated on each device
 //!   against its own LEDs so a zone never has to be resolved centrally.
+//! - [`records`] — replicated state: hybrid logical clocks, who may sign what,
+//!   and gossip. Every record is signed, because the mesh key is symmetric and
+//!   a shared secret alone would let any paired device forge a scene.
 //!
 //! # What is not
 //!
@@ -29,6 +32,7 @@ extern crate alloc;
 
 pub mod election;
 pub mod node;
+pub mod records;
 pub mod sources;
 pub mod sync;
 pub mod zones;
@@ -37,6 +41,7 @@ use lumen_proto::Uuid;
 
 pub use election::{Candidacy, Election, Role};
 pub use node::Node;
+pub use records::{Authority, Hlc, Record, RecordType, Store};
 pub use sources::{Source, SourceStack};
 pub use sync::{Sync, SyncState};
 pub use zones::{MapQuality, Projection, Zone};
