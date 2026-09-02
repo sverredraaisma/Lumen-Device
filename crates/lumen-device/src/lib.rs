@@ -22,6 +22,8 @@
 //!   ownership and a defined decay when a producer dies.
 //! - [`render`] — the render loop, where the stack, the zones and the VM meet
 //!   and a pixel finally gets a colour.
+//! - [`gateway`] — what an unauthenticated integration is allowed to do. Bound
+//!   to a pixel range and a priority ceiling, and never allowed a program.
 //!
 //! # What is not
 //!
@@ -36,6 +38,7 @@ extern crate alloc;
 
 pub mod channels;
 pub mod election;
+pub mod gateway;
 pub mod node;
 pub mod records;
 pub mod render;
@@ -47,6 +50,7 @@ use lumen_proto::Uuid;
 
 pub use channels::{Channel, Channels};
 pub use election::{Candidacy, Election, Role};
+pub use gateway::{Binding, Gateway};
 pub use node::Node;
 pub use records::{Authority, Hlc, Record, RecordType, Store};
 pub use render::{Renderer, Rgb};
