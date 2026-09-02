@@ -21,8 +21,8 @@ use std::fmt::Write as _;
 use crate::net::NetFaults;
 use crate::record::Recording;
 use crate::scenario::Op;
-use crate::world::{op_node, op_tag, TraceKind};
-use lumen_device::{Action, Event};
+use crate::world::{op_node, op_tag, EventKind, TraceKind};
+use lumen_device::Action;
 
 /// Schema version of the emitted vector. Matches the `"schema": 1` the codec
 /// vectors already carry, so the runner's dispatch does not need a special
@@ -160,9 +160,39 @@ fn op_detail(op: &Op) -> String {
 fn expected_json(kind: &TraceKind) -> Option<String> {
     match kind {
         TraceKind::Op { .. } => None,
-        TraceKind::Event(Event::Tick) => Some("\"event\": \"tick\"".to_string()),
+        TraceKind::Event(EventKind::Tick) => Some("\"event\": \"tick\"".to_string()),
+        TraceKind::Event(EventKind::Datagram { len }) => {
+            Some(format!("\"event\": \"datagram\", \"len\": {len}"))
+        }
+        TraceKind::Event(EventKind::PeerDiscovered { prefix }) => Some(format!(
+            "\"event\": \"peer_discovered\", \"prefix\": \"{}\"",
+            hex(prefix)
+        )),
+        TraceKind::Event(EventKind::PeerLost { prefix }) => Some(format!(
+            "\"event\": \"peer_lost\", \"prefix\": \"{}\"",
+            hex(prefix)
+        )),
         TraceKind::Action(Action::SetTimer { in_us }) => {
             Some(format!("\"action\": \"set_timer\", \"in_us\": {in_us}"))
+        }
+        TraceKind::Action(Action::Send { to, datagram }) => Some(format!(
+            "\"action\": \"send\", \"to\": {}, \"datagram\": \"{}\"",
+            match to {
+                lumen_device::Destination::Mesh => "\"mesh\"".to_string(),
+                lumen_device::Destination::Peer(p) => format!("\"{}\"", hex(p)),
+            },
+            hex(datagram)
+        )),
+        TraceKind::Action(Action::DisciplineClock { offset_us }) => Some(format!(
+            "\"action\": \"discipline\", \"offset_us\": {offset_us}"
+        )),
+        TraceKind::Action(Action::RoleChanged { role, epoch }) => Some(format!(
+            "\"action\": \"role\", \"role\": \"{}\", \"epoch\": {epoch}",
+            role_tag(*role)
+        )),
+        TraceKind::Action(Action::SyncLost) => Some("\"action\": \"sync_lost\"".to_string()),
+        TraceKind::Action(Action::SyncAcquired) => {
+            Some("\"action\": \"sync_acquired\"".to_string())
         }
         TraceKind::Rx { from, len, .. } => {
             Some(format!("\"rx\": {{ \"from\": {from}, \"len\": {len} }}"))
@@ -174,6 +204,15 @@ fn expected_json(kind: &TraceKind) -> Option<String> {
         TraceKind::Net(_) => Some("\"rejected\": \"net\"".to_string()),
         TraceKind::Store(_) => Some("\"rejected\": \"storage\"".to_string()),
         TraceKind::Led(_) => Some("\"rejected\": \"led\"".to_string()),
+    }
+}
+
+/// A stable name per role, so a vector does not depend on Rust's Debug output.
+fn role_tag(role: lumen_device::Role) -> &'static str {
+    match role {
+        lumen_device::Role::Follower => "follower",
+        lumen_device::Role::Candidate => "candidate",
+        lumen_device::Role::Leader => "leader",
     }
 }
 

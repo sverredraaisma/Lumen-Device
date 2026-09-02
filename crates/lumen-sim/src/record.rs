@@ -17,8 +17,8 @@ use crate::led::LedError;
 use crate::net::{NetError, NetFaults, NetStats, NodeId};
 use crate::scenario::{NodeSpec, Op, Scenario, ScriptedOp};
 use crate::storage::StorageError;
-use crate::world::{op_tag, NodeCore, RunReport, TraceEntry, TraceKind, World};
-use lumen_device::{Action, Event};
+use crate::world::{op_tag, EventKind, NodeCore, RunReport, TraceEntry, TraceKind, World};
+use lumen_device::Action;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -466,8 +466,31 @@ fn op_from_text(t: &mut Tokens<'_>, line: usize) -> Result<Op, ParseError> {
 fn trace_to_text(kind: &TraceKind) -> String {
     match kind {
         TraceKind::Op { tag } => format!("op {tag}"),
-        TraceKind::Event(Event::Tick) => "event tick".to_string(),
+        TraceKind::Event(EventKind::Tick) => "event tick".to_string(),
+        TraceKind::Event(EventKind::Datagram { len }) => format!("event datagram {len}"),
+        TraceKind::Event(EventKind::PeerDiscovered { prefix }) => {
+            format!("event peer_up {}", hex4(prefix))
+        }
+        TraceKind::Event(EventKind::PeerLost { prefix }) => {
+            format!("event peer_down {}", hex4(prefix))
+        }
         TraceKind::Action(Action::SetTimer { in_us }) => format!("action set_timer {in_us}"),
+        TraceKind::Action(Action::Send { to, datagram }) => format!(
+            "action send {} {}",
+            match to {
+                lumen_device::Destination::Mesh => "mesh".to_string(),
+                lumen_device::Destination::Peer(p) => hex4(p),
+            },
+            hex_bytes(datagram)
+        ),
+        TraceKind::Action(Action::DisciplineClock { offset_us }) => {
+            format!("action discipline {offset_us}")
+        }
+        TraceKind::Action(Action::RoleChanged { role, epoch }) => {
+            format!("action role {} {epoch}", role_name(*role))
+        }
+        TraceKind::Action(Action::SyncLost) => "action sync_lost".to_string(),
+        TraceKind::Action(Action::SyncAcquired) => "action sync_acquired".to_string(),
         TraceKind::Rx { from, len, digest } => format!("rx {from} {len} {digest:016x}"),
         TraceKind::Frame { digest } => format!("frame {digest:016x}"),
         TraceKind::Net(e) => format!("net_err {}", net_err_tag(e)),
@@ -483,13 +506,46 @@ fn trace_from_text(t: &mut Tokens<'_>, line: usize) -> Result<TraceKind, ParseEr
             tag: op_tag_from_str(next_token(t, line, "op tag")?, line)?,
         },
         "event" => match next_token(t, line, "event")? {
-            "tick" => TraceKind::Event(Event::Tick),
+            "tick" => TraceKind::Event(EventKind::Tick),
+            "datagram" => TraceKind::Event(EventKind::Datagram {
+                len: num(t, line, "len")?,
+            }),
+            "peer_up" => TraceKind::Event(EventKind::PeerDiscovered {
+                prefix: prefix4(t, line)?,
+            }),
+            "peer_down" => TraceKind::Event(EventKind::PeerLost {
+                prefix: prefix4(t, line)?,
+            }),
             other => return Err(ParseError::new(line, format!("unknown event {other:?}"))),
         },
         "action" => match next_token(t, line, "action")? {
             "set_timer" => TraceKind::Action(Action::SetTimer {
                 in_us: num(t, line, "in_us")?,
             }),
+            "send" => {
+                let dest = next_token(t, line, "destination")?;
+                let to = if dest == "mesh" {
+                    lumen_device::Destination::Mesh
+                } else {
+                    lumen_device::Destination::Peer(parse_prefix(dest, line)?)
+                };
+                TraceKind::Action(Action::Send {
+                    to,
+                    datagram: parse_bytes(next_token(t, line, "datagram")?, line)?,
+                })
+            }
+            "discipline" => TraceKind::Action(Action::DisciplineClock {
+                offset_us: signed(t, line, "offset_us")?,
+            }),
+            "role" => {
+                let role = parse_role(next_token(t, line, "role")?, line)?;
+                TraceKind::Action(Action::RoleChanged {
+                    role,
+                    epoch: num(t, line, "epoch")?,
+                })
+            }
+            "sync_lost" => TraceKind::Action(Action::SyncLost),
+            "sync_acquired" => TraceKind::Action(Action::SyncAcquired),
             other => return Err(ParseError::new(line, format!("unknown action {other:?}"))),
         },
         "rx" => TraceKind::Rx {
@@ -580,6 +636,86 @@ fn led_err_tag(e: &LedError) -> &'static str {
         LedError::WrongPixelCount => "wrong_pixel_count",
         LedError::PoweredOff => "powered_off",
     }
+}
+
+/// Four bytes as hex, for a sender prefix.
+fn hex4(bytes: &[u8; 4]) -> String {
+    hex_bytes(bytes)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2 + 1);
+    if bytes.is_empty() {
+        // An empty field would read as a missing token and shift every field
+        // after it, which is the classic way a hand-rolled line format loses
+        // data silently.
+        return "-".to_string();
+    }
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn parse_bytes(text: &str, line: usize) -> Result<Vec<u8>, ParseError> {
+    if text == "-" {
+        return Ok(Vec::new());
+    }
+    if text.len() % 2 != 0 {
+        return Err(ParseError::new(line, "hex field has an odd length"));
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let raw = text.as_bytes();
+    for pair in raw.chunks(2) {
+        let hi = hex_digit(pair[0], line)?;
+        let lo = hex_digit(pair[1], line)?;
+        out.push(hi * 16 + lo);
+    }
+    Ok(out)
+}
+
+fn parse_prefix(text: &str, line: usize) -> Result<[u8; 4], ParseError> {
+    let bytes = parse_bytes(text, line)?;
+    bytes
+        .try_into()
+        .map_err(|_| ParseError::new(line, "a sender prefix is four bytes"))
+}
+
+fn prefix4(t: &mut Tokens<'_>, line: usize) -> Result<[u8; 4], ParseError> {
+    parse_prefix(next_token(t, line, "prefix")?, line)
+}
+
+fn hex_digit(c: u8, line: usize) -> Result<u8, ParseError> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(ParseError::new(line, "not a hex digit")),
+    }
+}
+
+fn signed(t: &mut Tokens<'_>, line: usize, what: &str) -> Result<i64, ParseError> {
+    next_token(t, line, what)?
+        .parse()
+        .map_err(|_| ParseError::new(line, format!("{what} is not a signed number")))
+}
+
+fn role_name(role: lumen_device::Role) -> &'static str {
+    match role {
+        lumen_device::Role::Follower => "follower",
+        lumen_device::Role::Candidate => "candidate",
+        lumen_device::Role::Leader => "leader",
+    }
+}
+
+fn parse_role(text: &str, line: usize) -> Result<lumen_device::Role, ParseError> {
+    Ok(match text {
+        "follower" => lumen_device::Role::Follower,
+        "candidate" => lumen_device::Role::Candidate,
+        "leader" => lumen_device::Role::Leader,
+        other => return Err(ParseError::new(line, format!("unknown role {other:?}"))),
+    })
 }
 
 #[cfg(test)]
@@ -866,7 +1002,7 @@ mod tests {
     fn every_trace_kind_survives_the_round_trip() {
         let kinds = vec![
             TraceKind::Op { tag: "heal_all" },
-            TraceKind::Event(Event::Tick),
+            TraceKind::Event(EventKind::Tick),
             TraceKind::Action(Action::SetTimer { in_us: 42 }),
             TraceKind::Rx {
                 from: 3,

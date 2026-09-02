@@ -9,3 +9,7 @@ rust-version.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Path rather than a version: nothing is on crates.io yet and there is no git
+# remote. This is the layout lumen-dev/scripts/clone-all.sh produces.
+# TODO(release): becomes `lumen-proto = "0.1"` at the first lumen-core release.
+lumen-proto = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-proto" }

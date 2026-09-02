@@ -1,27 +1,123 @@
-//! Mesh state machines — skeleton (W5, W6, W7 fill this in).
+//! Mesh state machines.
 //!
 //! Sans-IO throughout: every state machine here is `on_event(now, ev) ->
 //! Vec<Action>`. The shell around it owns the sockets, the timers and the flash
 //! writes; this crate cannot reach them, which is what makes replay
 //! deterministic and behavioural conformance testable.
+//!
+//! # What is here
+//!
+//! - [`sync`] — the time-sync state machine. Unsynced → Syncing → Synced, with
+//!   RTT filtering and a clock that **slews and never steps**.
+//! - [`election`] — timebase election. Compares capacity only, never load.
+//! - [`Node`] — the two together, decoding datagrams and emitting them.
+//!
+//! # What is not
+//!
+//! Discovery is deliberately absent. Finding peers is mDNS, a broadcast probe,
+//! or a static list depending on the transport — all of it I/O, none of it a
+//! decision. The shell tells the core about a peer with
+//! [`Event::PeerDiscovered`] and the core does not care how it found out.
 
 #![forbid(unsafe_code)]
 
+pub mod election;
+pub mod node;
+pub mod sync;
+
+use lumen_proto::Uuid;
+
+pub use election::{Candidacy, Election, Role};
+pub use node::Node;
+pub use sync::{Sync, SyncState};
+
+/// Microseconds on the show clock.
+pub type ShowTimeUs = u64;
+
+/// How a datagram should be sent.
+///
+/// The core says *what kind of reach* a message needs, not which socket. A
+/// `TICK` goes to everyone; a `SYNC_REQ` goes to one peer. The shell maps that
+/// onto multicast groups and addresses, which is exactly the knowledge it has
+/// and the core does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Destination {
+    /// Every device in the mesh.
+    Mesh,
+    /// One peer, identified by the prefix that appears in a header.
+    Peer([u8; 4]),
+}
+
 /// Everything the outside world can tell a node about.
 ///
-/// The variants land with their workstreams; `Tick` exists from the start
-/// because a sans-IO core has no other way to notice that time passed.
+/// Borrowed rather than owned: a datagram is parsed in place and never copied,
+/// which is what keeps the receive path allocation-free on a device.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Event {
-    /// The shell advanced the show clock.
+pub enum Event<'a> {
+    /// A timer the core asked for has fired.
     Tick,
+    /// Bytes arrived. The core parses them; the shell does not look inside.
+    Datagram { bytes: &'a [u8] },
+    /// The shell found a peer, however it does that.
+    PeerDiscovered { prefix: [u8; 4] },
+    /// The shell lost a peer.
+    PeerLost { prefix: [u8; 4] },
 }
 
 /// Everything a node can ask the outside world to do.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Action {
     /// Call back in at most this many microseconds.
+    ///
+    /// A hint, not a contract: waking late is a quality problem, waking early is
+    /// free. The core recomputes what it owes on every event.
     SetTimer { in_us: u64 },
+    /// Send these bytes. Already framed and ready for the wire.
+    Send { to: Destination, datagram: Vec<u8> },
+    /// Move the show clock by this much, by **slewing the rate**.
+    ///
+    /// Never a step. A stepped render clock is a visible glitch, and every
+    /// effect is a function of this clock.
+    DisciplineClock { offset_us: i64 },
+    /// This node took or lost the timebase.
+    RoleChanged { role: Role, epoch: u32 },
+    /// Suppress tightly-synced content: the clock is not trustworthy.
+    ///
+    /// Rendering a synchronised show while unsynced looks broken in a way that
+    /// suggests a hardware fault. Not rendering it is the defined degradation.
+    SyncLost,
+    /// The clock is trustworthy again.
+    SyncAcquired,
+}
+
+/// Who this device is, for election purposes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Identity {
+    pub uuid: Uuid,
+    /// Static benchmark score, "VM instructions per second ÷ 1000".
+    ///
+    /// **Never current load.** Load changes constantly, so electing on it makes
+    /// the role flap between devices, and a role that flaps is worse than a
+    /// slightly suboptimal one that holds. Load is advisory and used for budgets
+    /// and the UI, nowhere near this.
+    pub capacity: u32,
+}
+
+impl Identity {
+    pub fn new(uuid: Uuid, capacity: u32) -> Identity {
+        Identity { uuid, capacity }
+    }
+
+    pub fn candidacy(&self) -> Candidacy {
+        Candidacy {
+            capacity: self.capacity,
+            uuid: self.uuid,
+        }
+    }
+
+    pub fn prefix(&self) -> [u8; 4] {
+        self.uuid.sender_prefix()
+    }
 }
 
 /// A source of pixels claiming a zone, with a priority and an expiry.

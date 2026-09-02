@@ -5,9 +5,16 @@ version = 4
 [[package]]
 name = "lumen-device"
 version = "0.1.0"
+dependencies = [
+ "lumen-proto",
+]
 
 [[package]]
 name = "lumen-hal"
+version = "0.1.0"
+
+[[package]]
+name = "lumen-proto"
 version = "0.1.0"
 
 [[package]]
@@ -16,4 +23,5 @@ version = "0.1.0"
 dependencies = [
  "lumen-device",
  "lumen-hal",
+ "lumen-proto",
 ]

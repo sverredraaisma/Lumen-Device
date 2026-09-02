@@ -27,7 +27,7 @@ use crate::storage::{SimStorage, StorageError};
 /// and not a redesign.
 pub trait NodeCore {
     /// The `on_event(now, ev) -> Vec<Action>` contract, unchanged.
-    fn on_event(&mut self, now_us: u64, ev: Event) -> Vec<Action>;
+    fn on_event(&mut self, now_us: u64, ev: Event<'_>) -> Vec<Action>;
 
     /// A datagram arrived.
     ///
@@ -50,7 +50,7 @@ pub trait NodeCore {
 pub struct IdleCore;
 
 impl NodeCore for IdleCore {
-    fn on_event(&mut self, _now_us: u64, _ev: Event) -> Vec<Action> {
+    fn on_event(&mut self, _now_us: u64, _ev: Event<'_>) -> Vec<Action> {
         Vec::new()
     }
 }
@@ -83,7 +83,7 @@ impl PeriodicCore {
 }
 
 impl NodeCore for PeriodicCore {
-    fn on_event(&mut self, _now_us: u64, _ev: Event) -> Vec<Action> {
+    fn on_event(&mut self, _now_us: u64, _ev: Event<'_>) -> Vec<Action> {
         self.fired += 1;
         vec![Action::SetTimer {
             in_us: self.period_us,
@@ -147,12 +147,37 @@ pub struct TraceEntry {
 /// What happened. Everything a run does that could differ between two runs is
 /// in here, because "identical run" is defined as "identical trace" and
 /// anything left out of the trace is something replay would not catch.
+/// A borrow-free description of an [`Event`], for the trace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EventKind {
+    Tick,
+    Datagram { len: usize },
+    PeerDiscovered { prefix: [u8; 4] },
+    PeerLost { prefix: [u8; 4] },
+}
+
+impl EventKind {
+    pub fn of(ev: &Event<'_>) -> EventKind {
+        match ev {
+            Event::Tick => EventKind::Tick,
+            Event::Datagram { bytes } => EventKind::Datagram { len: bytes.len() },
+            Event::PeerDiscovered { prefix } => EventKind::PeerDiscovered { prefix: *prefix },
+            Event::PeerLost { prefix } => EventKind::PeerLost { prefix: *prefix },
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TraceKind {
     /// A scripted op was applied. `tag` names the variant.
     Op { tag: &'static str },
     /// An event was delivered to a core.
-    Event(Event),
+    ///
+    /// Recorded as a description rather than the event itself: `Event` borrows
+    /// the received bytes, and a trace entry has to outlive the buffer they
+    /// came from. The description is what a diff between two runs compares
+    /// anyway.
+    Event(EventKind),
     /// A core emitted an action.
     Action(Action),
     /// A datagram reached a core.
@@ -581,7 +606,9 @@ impl World {
                         worked = true;
                         let from_id = from_node_id(&from);
                         let digest = fnv1a(fnv1a_new(), &buf[..len]);
-                        let actions = node.core.on_datagram(now, from_id, &buf[..len]);
+                        let actions = node
+                            .core
+                            .on_event(now, Event::Datagram { bytes: &buf[..len] });
                         self.trace.push(TraceEntry {
                             at_us: self.now_us,
                             node: id,
@@ -636,7 +663,7 @@ impl World {
         self.trace.push(TraceEntry {
             at_us: self.now_us,
             node: id,
-            kind: TraceKind::Event(ev),
+            kind: TraceKind::Event(EventKind::of(&ev)),
         });
         self.apply_actions(id, &actions);
     }
@@ -646,7 +673,7 @@ impl World {
             self.trace.push(TraceEntry {
                 at_us: self.now_us,
                 node: id,
-                kind: TraceKind::Action(*action),
+                kind: TraceKind::Action(action.clone()),
             });
             match action {
                 Action::SetTimer { in_us } => {
@@ -658,6 +685,18 @@ impl World {
                         let at = self.now_us.saturating_add(*in_us);
                         node.timer_at_us = Some(node.timer_at_us.map_or(at, |t| t.min(at)));
                     }
+                }
+                Action::Send { .. }
+                | Action::DisciplineClock { .. }
+                | Action::RoleChanged { .. }
+                | Action::SyncLost
+                | Action::SyncAcquired => {
+                    // Traced above, and that is enough for now. Wiring `Send`
+                    // into the fabric and `DisciplineClock` into `SimClock` is
+                    // what turns the harness-level scenarios in tests/ into
+                    // behavioural ones; doing it here without the source stack
+                    // and render loop would only be able to assert half of what
+                    // those scenarios are for.
                 }
             }
         }
@@ -733,7 +772,7 @@ mod tests {
     }
 
     impl NodeCore for CountingCore {
-        fn on_event(&mut self, _now_us: u64, _ev: Event) -> Vec<Action> {
+        fn on_event(&mut self, _now_us: u64, _ev: Event<'_>) -> Vec<Action> {
             self.events += 1;
             self.rearm_us
                 .map(|in_us| vec![Action::SetTimer { in_us }])
@@ -772,7 +811,7 @@ mod tests {
             kinds,
             vec![
                 &TraceKind::Op { tag: "tick" },
-                &TraceKind::Event(Event::Tick)
+                &TraceKind::Event(EventKind::Tick)
             ]
         );
     }
@@ -785,14 +824,14 @@ mod tests {
         let fires = report
             .trace
             .iter()
-            .filter(|e| e.kind == TraceKind::Event(Event::Tick))
+            .filter(|e| e.kind == TraceKind::Event(EventKind::Tick))
             .count();
         // One scripted tick at 0, then one every millisecond up to 10 000.
         assert_eq!(fires, 11);
         let times: Vec<u64> = report
             .trace
             .iter()
-            .filter(|e| e.kind == TraceKind::Event(Event::Tick))
+            .filter(|e| e.kind == TraceKind::Event(EventKind::Tick))
             .map(|e| e.at_us)
             .collect();
         assert_eq!(times.first(), Some(&0));
@@ -803,7 +842,7 @@ mod tests {
     fn the_earliest_requested_timer_wins() {
         struct TwoTimers;
         impl NodeCore for TwoTimers {
-            fn on_event(&mut self, _now_us: u64, _ev: Event) -> Vec<Action> {
+            fn on_event(&mut self, _now_us: u64, _ev: Event<'_>) -> Vec<Action> {
                 vec![
                     Action::SetTimer { in_us: 1_000_000 },
                     Action::SetTimer { in_us: 500 },
@@ -825,7 +864,7 @@ mod tests {
             report
                 .trace
                 .iter()
-                .filter(|e| e.kind == TraceKind::Event(Event::Tick))
+                .filter(|e| e.kind == TraceKind::Event(EventKind::Tick))
                 .count(),
             1
         );
@@ -984,7 +1023,7 @@ mod tests {
         let ticks_while_dead = report
             .trace
             .iter()
-            .filter(|e| e.node == 1 && e.kind == TraceKind::Event(Event::Tick))
+            .filter(|e| e.node == 1 && e.kind == TraceKind::Event(EventKind::Tick))
             .filter(|e| (5_000..7_000).contains(&e.at_us))
             .count();
         assert_eq!(ticks_while_dead, 0);

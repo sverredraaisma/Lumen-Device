@@ -68,4 +68,6 @@ pub use record::{record, replay, verify_replay, Divergence, ParseError, Recordin
 pub use rng::SimRng;
 pub use scenario::{NodeSpec, Op, Scenario, ScriptedOp};
 pub use storage::{SimStorage, StorageError};
-pub use world::{IdleCore, Node, NodeCore, PeriodicCore, RunReport, TraceEntry, TraceKind, World};
+pub use world::{
+    EventKind, IdleCore, Node, NodeCore, PeriodicCore, RunReport, TraceEntry, TraceKind, World,
+};
