@@ -11,6 +11,8 @@
 //!   RTT filtering and a clock that **slews and never steps**.
 //! - [`election`] — timebase election. Compares capacity only, never load.
 //! - [`Node`] — the two together, decoding datagrams and emitting them.
+//! - [`sources`] — the source stack. One mechanism for shows, schedules,
+//!   alerts, manual control and streams, with priority and expiry on every one.
 //!
 //! # What is not
 //!
@@ -23,12 +25,14 @@
 
 pub mod election;
 pub mod node;
+pub mod sources;
 pub mod sync;
 
 use lumen_proto::Uuid;
 
 pub use election::{Candidacy, Election, Role};
 pub use node::Node;
+pub use sources::{Source, SourceStack};
 pub use sync::{Sync, SyncState};
 
 /// Microseconds on the show clock.
