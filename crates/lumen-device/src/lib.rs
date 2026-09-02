@@ -18,6 +18,8 @@
 //! - [`records`] — replicated state: hybrid logical clocks, who may sign what,
 //!   and gossip. Every record is signed, because the mesh key is symmetric and
 //!   a shared secret alone would let any paired device forge a scene.
+//! - [`channels`] — the broadcast uniforms an effect reads, with claim-and-lease
+//!   ownership and a defined decay when a producer dies.
 //!
 //! # What is not
 //!
@@ -30,6 +32,7 @@
 
 extern crate alloc;
 
+pub mod channels;
 pub mod election;
 pub mod node;
 pub mod records;
@@ -39,6 +42,7 @@ pub mod zones;
 
 use lumen_proto::Uuid;
 
+pub use channels::{Channel, Channels};
 pub use election::{Candidacy, Election, Role};
 pub use node::Node;
 pub use records::{Authority, Hlc, Record, RecordType, Store};
