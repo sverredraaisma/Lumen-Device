@@ -145,6 +145,12 @@ impl Renderer {
     /// `out` must be as long as the device has LEDs. Anything no source covers
     /// keeps the value already there, which is what makes an ambient floor an
     /// ambient floor rather than a special case.
+    ///
+    /// Eight parameters, and each one is a distinct input the loop genuinely
+    /// needs. Bundling them into a context struct would move the same list one
+    /// level away and make the borrow checker's job harder for no reader's
+    /// benefit.
+    #[allow(clippy::too_many_arguments)]
     pub fn render<U: Uniforms>(
         &mut self,
         now_us: u64,
@@ -216,10 +222,7 @@ impl Renderer {
         if b.membership.is_empty() {
             return false;
         }
-        let machine = self
-            .machines
-            .entry(b.source.id)
-            .or_insert_with(Machine::new);
+        let machine = self.machines.entry(b.source.id).or_default();
         machine.set_budget(b.program.budget.max(1));
 
         if let Err(fault) = machine.run_frame_at(b.program, t, uniforms) {
