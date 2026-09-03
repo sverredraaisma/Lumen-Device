@@ -121,12 +121,20 @@ impl Mesh {
     /// Tick every node, then deliver everything they sent, repeatedly until the
     /// instant settles. Bounded, so a node pair that answered each other forever
     /// fails the test rather than hanging it.
+    ///
+    /// The bound has to clear the longest legitimate exchange in the protocol,
+    /// which is a sync burst: `SAMPLES_REQUIRED` request/response pairs, each
+    /// one a round through this loop. Sized off that constant rather than
+    /// written as a number, because it was previously 32 against a burst of 8
+    /// and every mesh test failed the moment the burst was measured and raised.
+    const SETTLE_ROUNDS: usize = lumen_device::sync::SAMPLES_REQUIRED * 4;
+
     fn step(&mut self, now_us: u64) {
         for i in 0..self.nodes.len() {
             let actions = self.nodes[i].on_event(now_us, Event::Tick);
             self.queue(i, &actions);
         }
-        for _ in 0..32 {
+        for _ in 0..Self::SETTLE_ROUNDS {
             if self.in_flight.is_empty() {
                 return;
             }
