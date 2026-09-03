@@ -45,6 +45,54 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+  conformance:
+    name: behavioural conformance vectors
+    runs-on: ubuntu-latest
+    steps:
+      # Three checkouts: this repo, lumen-core for the codec the state machines
+      # speak, and lumen-spec for the vectors and the runner. That is the whole
+      # point of the job — the vectors are normative and live in another repo,
+      # so nothing here can quietly change what conformance means.
+      - uses: actions/checkout@v4
+        with:
+          path: lumen-device
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Lumen-Core
+          path: lumen-core
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Lumen-Spec
+          path: lumen-spec
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lumen-device/adapters/conformance
+      # The adapter is outside the workspace, so the fmt and clippy job above
+      # never sees it. Held to the same bar here rather than left as the one
+      # unchecked crate in the repo.
+      - name: the adapter is formatted and lint-clean
+        working-directory: lumen-device/adapters/conformance
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+      - name: build the adapter
+        working-directory: lumen-device/adapters/conformance
+        run: cargo build --release
+      # Runs every behavioural vector against the real state machines. Before
+      # this job existed the suite only ever ran against the reference fixture,
+      # which answers from the corpus and so passed by construction: twelve
+      # vectors that could not fail.
+      - name: run the vectors against the real implementation
+        working-directory: lumen-spec
+        run: |
+          adapter="../lumen-device/adapters/conformance/target/release/lumen-device-adapter"
+          cargo run --release --bin lumen-conformance -- --adapter "$adapter" vectors/behavioural/
+
   coverage:
     name: coverage >= 95%
     runs-on: ubuntu-latest

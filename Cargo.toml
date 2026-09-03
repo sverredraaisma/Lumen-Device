@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/lumen-device", "crates/lumen-sim"]
+# The conformance adapter is deliberately not a member. It depends on the
+# runner in the sibling `lumen-spec` checkout, and making `cargo test
+# --workspace` need that checkout would put a second repo between a contributor
+# and a green test run. The conformance CI job builds it explicitly.
+exclude = ["adapters/conformance"]
 
 [workspace.package]
 version = "0.1.0"

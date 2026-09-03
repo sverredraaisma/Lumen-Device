@@ -1,0 +1,25 @@
+[package]
+name = "lumen-device-adapter"
+description = "Conformance adapter: drives lumen-device's state machines from lumen-spec's behavioural vectors"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/sverredraaisma/Lumen-Device"
+rust-version = "1.85"
+authors = ["The Lumen contributors"]
+
+[[bin]]
+name = "lumen-device-adapter"
+path = "src/main.rs"
+
+[dependencies]
+lumen-device = { version = "0.1.0", path = "../../crates/lumen-device" }
+lumen-proto = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-proto" }
+
+# The runner's own JSON and hex, so the adapter cannot disagree with it about
+# what a vector says. A second parser here is how an adapter ends up passing
+# vectors the runner would have read differently.
+#
+# Path rather than a version: nothing is published yet.
+# TODO(release): becomes `lumen-conformance = "0.1"`.
+lumen-conformance = { version = "0.1.0", path = "../../../lumen-spec/runner" }
