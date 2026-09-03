@@ -25,7 +25,7 @@ use lumen_proto::{Datagram, Payload, Uuid, Writer};
 
 use crate::election::{self, Election, Outcome as ElectionOutcome, Role};
 use crate::sync::{self, Sample, Sync};
-use crate::{Action, Destination, Event, Identity};
+use crate::{Action, Destination, Event, Identity, Transport};
 
 /// Largest payload this node builds. Every message it sends is far smaller; the
 /// buffer is stack-allocated, so the bound is what keeps it there.
@@ -340,13 +340,92 @@ impl Node {
         out.push(Action::Send {
             to,
             datagram: framed,
+            // Derived from the message rather than passed in, so a caller
+            // cannot send a record unreliably by forgetting to say otherwise —
+            // which would replicate nothing and show up much later as two
+            // devices disagreeing about a scene.
+            transport: transport_for(msg_type),
         });
+    }
+}
+
+/// Which transport a message type requires.
+///
+/// The table in `wire-format.md`, in code. Everything that is replaced on a
+/// schedule goes best-effort — another tick or frame is along in milliseconds,
+/// and a retransmission would arrive after the moment it described. Everything
+/// that is said once has to arrive.
+fn transport_for(msg_type: MsgType) -> Transport {
+    match msg_type {
+        MsgType::Tick
+        | MsgType::SyncReq
+        | MsgType::SyncResp
+        | MsgType::Chan
+        | MsgType::Frame
+        | MsgType::ProbeData => Transport::Datagram,
+        _ => Transport::Reliable,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn everything_replaced_on_a_schedule_goes_best_effort() {
+        // A retransmitted tick describes a moment that has passed, and a
+        // retransmitted frame arrives after the one that replaced it. Paying
+        // for delivery here would make the hot path slower and the result
+        // later.
+        for t in [
+            MsgType::Tick,
+            MsgType::SyncReq,
+            MsgType::SyncResp,
+            MsgType::Chan,
+            MsgType::Frame,
+            MsgType::ProbeData,
+        ] {
+            assert_eq!(transport_for(t), Transport::Datagram, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn everything_said_once_has_to_arrive() {
+        // A `STATE_PUSH` sent unreliably is a record that silently does not
+        // replicate, and that surfaces much later as two devices disagreeing
+        // about a scene with nothing to point at.
+        for t in [
+            MsgType::StateDigest,
+            MsgType::StatePull,
+            MsgType::StatePush,
+            MsgType::Activate,
+            MsgType::SrcPush,
+            MsgType::ChanClaim,
+            MsgType::ProgBegin,
+            MsgType::ProgChunk,
+            MsgType::ProgEnd,
+            MsgType::Hello,
+        ] {
+            assert_eq!(transport_for(t), Transport::Reliable, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn a_tick_this_node_sends_is_addressed_to_the_mesh_and_unreliable() {
+        // The two halves of the routing decision, on the one message every node
+        // sends without being asked.
+        let mut a = node(1000, 0x11, 0);
+        // Long enough with no better candidate that it takes the timebase.
+        let mut sent = None;
+        for at in [1_000_000u64, 4_000_000, 7_000_000] {
+            for action in a.on_event(at, Event::Tick) {
+                if let Action::Send { to, transport, .. } = action {
+                    sent = Some((to, transport));
+                }
+            }
+        }
+        assert_eq!(sent, Some((Destination::Mesh, Transport::Datagram)));
+    }
 
     const MESH: Uuid = Uuid([0xAB; 16]);
 

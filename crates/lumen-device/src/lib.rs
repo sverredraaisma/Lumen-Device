@@ -76,6 +76,26 @@ pub enum Destination {
     Peer([u8; 4]),
 }
 
+/// Which way a datagram has to travel.
+///
+/// The core says, rather than the shell working it out. The shell would have to
+/// read the type byte back out of the header the core just built, and the
+/// routing table would then live in the wire format *and* in every shell, which
+/// is two places for one fact.
+///
+/// This is a requirement, not a hint: a `STATE_PUSH` sent unreliably is a record
+/// that silently does not replicate, and that failure shows up much later as two
+/// devices disagreeing about a scene.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    /// Best effort, and usually multicast. Ticks, frames and channels: another
+    /// one is along in 16 ms, so a lost packet is cheaper than a retransmission.
+    Datagram,
+    /// Ordered and retransmitted. Replication, pairing and configuration, where
+    /// arriving late beats not arriving.
+    Reliable,
+}
+
 /// Everything the outside world can tell a node about.
 ///
 /// Borrowed rather than owned: a datagram is parsed in place and never copied,
@@ -101,7 +121,11 @@ pub enum Action {
     /// free. The core recomputes what it owes on every event.
     SetTimer { in_us: u64 },
     /// Send these bytes. Already framed and ready for the wire.
-    Send { to: Destination, datagram: Vec<u8> },
+    Send {
+        to: Destination,
+        datagram: Vec<u8>,
+        transport: Transport,
+    },
     /// Move the show clock by this much, by **slewing the rate**.
     ///
     /// Never a step. A stepped render clock is a visible glitch, and every

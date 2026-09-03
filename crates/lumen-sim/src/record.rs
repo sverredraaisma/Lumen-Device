@@ -475,11 +475,21 @@ fn trace_to_text(kind: &TraceKind) -> String {
             format!("event peer_down {}", hex4(prefix))
         }
         TraceKind::Action(Action::SetTimer { in_us }) => format!("action set_timer {in_us}"),
-        TraceKind::Action(Action::Send { to, datagram }) => format!(
-            "action send {} {}",
+        TraceKind::Action(Action::Send {
+            to,
+            datagram,
+            transport,
+        }) => format!(
+            // Transport before the bytes: it is one short token and the
+            // datagram is unbounded, so a line stays readable when it wraps.
+            "action send {} {} {}",
             match to {
                 lumen_device::Destination::Mesh => "mesh".to_string(),
                 lumen_device::Destination::Peer(p) => hex4(p),
+            },
+            match transport {
+                lumen_device::Transport::Datagram => "datagram",
+                lumen_device::Transport::Reliable => "reliable",
             },
             hex_bytes(datagram)
         ),
@@ -529,9 +539,23 @@ fn trace_from_text(t: &mut Tokens<'_>, line: usize) -> Result<TraceKind, ParseEr
                 } else {
                     lumen_device::Destination::Peer(parse_prefix(dest, line)?)
                 };
+                let transport = match next_token(t, line, "transport")? {
+                    "datagram" => lumen_device::Transport::Datagram,
+                    "reliable" => lumen_device::Transport::Reliable,
+                    // Not defaulted: a replay that guessed the transport would
+                    // reproduce a run the recording never described, which is
+                    // the one thing a replay must not do.
+                    other => {
+                        return Err(ParseError::new(
+                            line,
+                            format!("unknown transport `{other}`"),
+                        ))
+                    }
+                };
                 TraceKind::Action(Action::Send {
                     to,
                     datagram: parse_bytes(next_token(t, line, "datagram")?, line)?,
+                    transport,
                 })
             }
             "discipline" => TraceKind::Action(Action::DisciplineClock {

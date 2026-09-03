@@ -152,7 +152,7 @@ impl Mesh {
 
     fn queue(&mut self, from: usize, actions: &[Action]) {
         for a in actions {
-            if let Action::Send { to, datagram } = a {
+            if let Action::Send { to, datagram, .. } = a {
                 self.in_flight.push((from, *to, datagram.clone()));
             }
         }

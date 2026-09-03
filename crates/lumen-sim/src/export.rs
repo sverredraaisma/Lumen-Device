@@ -175,7 +175,7 @@ fn expected_json(kind: &TraceKind) -> Option<String> {
         TraceKind::Action(Action::SetTimer { in_us }) => {
             Some(format!("\"action\": \"set_timer\", \"in_us\": {in_us}"))
         }
-        TraceKind::Action(Action::Send { to, datagram }) => Some(format!(
+        TraceKind::Action(Action::Send { to, datagram, .. }) => Some(format!(
             "\"action\": \"send\", \"to\": {}, \"datagram\": \"{}\"",
             match to {
                 lumen_device::Destination::Mesh => "\"mesh\"".to_string(),

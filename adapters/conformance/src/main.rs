@@ -28,7 +28,7 @@ use lumen_device::records::{Authority, Hlc, Record, RecordType, RejectReason, St
 use lumen_device::render::{Bound, RenderFault, Renderer, Rgb};
 use lumen_device::sources::{Change, PushError, Removal, Source, SourceStack};
 use lumen_device::zones::{Axis, Clause, CmpOp, DeviceLeds, Led, MapQuality, Predicate, Zone};
-use lumen_device::{Action, Destination, Event, Identity, Node, Role};
+use lumen_device::{Action, Destination, Event, Identity, Node, Role, Transport};
 use lumen_proto::Uuid;
 use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
@@ -900,13 +900,21 @@ fn render_node_action(a: &Action) -> String {
         Action::SetTimer { in_us } => {
             format!(r#"{{"action":"set_timer","in_us":{in_us}}}"#)
         }
-        Action::Send { to, datagram } => {
+        Action::Send {
+            to,
+            datagram,
+            transport,
+        } => {
             let dest = match to {
                 Destination::Mesh => "mesh".to_string(),
                 Destination::Peer(p) => hex::encode(p),
             };
+            let transport = match transport {
+                Transport::Datagram => "datagram",
+                Transport::Reliable => "reliable",
+            };
             format!(
-                r#"{{"action":"send","to":"{dest}","datagram":"{}"}}"#,
+                r#"{{"action":"send","to":"{dest}","transport":"{transport}","datagram":"{}"}}"#,
                 hex::encode(datagram)
             )
         }
