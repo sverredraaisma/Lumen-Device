@@ -17,6 +17,9 @@ lumen-device = { version = "0.1.0", path = "../../crates/lumen-device" }
 lumen-proto = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-proto" }
 # Channel values and defaults are Q16.
 lumen-vm = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-vm" }
+# Records are Ed25519-signed, and a vector that carried a fake signature would
+# pin nothing: the byte order the signature covers is the normative part.
+lumen-crypto = { version = "0.1.0", path = "../../../lumen-core/crates/lumen-crypto" }
 
 # The runner's own JSON and hex, so the adapter cannot disagree with it about
 # what a vector says. A second parser here is how an adapter ends up passing

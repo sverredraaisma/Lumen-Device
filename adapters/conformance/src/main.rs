@@ -19,10 +19,12 @@ use std::io::{BufRead, Write};
 
 use lumen_conformance::hex;
 use lumen_conformance::json::{parse, Json};
+use lumen_crypto::Ed25519Verifier;
 use lumen_device::channels::{Channel, ClaimOutcome};
 use lumen_device::gateway::{
     admit, Binding, BindingError, Ingress, Protocol, Refusal, MAX_GATEWAY_PRIORITY,
 };
+use lumen_device::records::{Authority, Hlc, Record, RecordType, RejectReason, Store};
 use lumen_device::sources::{Change, PushError, Removal, Source, SourceStack};
 use lumen_device::zones::{Axis, Clause, CmpOp, DeviceLeds, Led, MapQuality, Predicate, Zone};
 use lumen_device::{Action, Destination, Event, Identity, Node, Role};
@@ -70,6 +72,7 @@ enum Machine {
     /// Zone resolution is a pure function of a zone and one device's LEDs, so
     /// a vector resets both together.
     Zone(Box<(Zone, DeviceLeds)>),
+    Records(Box<(Store, Authority)>),
 }
 
 fn respond(line: &str, machine: &mut Machine) -> String {
@@ -149,6 +152,13 @@ fn reset(body: &Json, machine: &mut Machine) -> String {
             }
             Err(e) => format!("error {e}"),
         },
+        "records" => match build_authority(state) {
+            Ok(a) => {
+                *machine = Machine::Records(Box::new((Store::new(), a)));
+                "ok {}".to_string()
+            }
+            Err(e) => format!("error {e}"),
+        },
         // Naming a machine this implementation does not have is an `error`, not
         // a `reject`: the adapter failed to answer, rather than the
         // implementation refusing something.
@@ -208,7 +218,123 @@ fn event(body: &Json, machine: &mut Machine) -> String {
         Machine::Channel(ch) => channel_event(ch, at_us, kind, ev),
         Machine::Gateway(binding) => gateway_event(binding, at_us, kind, ev),
         Machine::Zone(z) => zone_event(&z.0, &z.1, kind),
+        Machine::Records(r) => records_event(&mut r.0, &r.1, kind, ev),
     }
+}
+
+fn key32(j: &Json, key: &str) -> Result<[u8; 32], String> {
+    let text = j
+        .get(key)
+        .and_then(Json::as_str)
+        .ok_or_else(|| format!("`{key}` is missing"))?;
+    let b = hex::decode(text).map_err(|e| format!("{key}: {e}"))?;
+    b.as_slice()
+        .try_into()
+        .map_err(|_| format!("`{key}` must be 32 bytes"))
+}
+
+fn build_authority(state: &Json) -> Result<Authority, String> {
+    let mut a = Authority::new();
+    if let Some(arr) = state.get("controllers").and_then(Json::as_array) {
+        for c in arr {
+            a.authorise_controller(uuid_field(c, "id")?, key32(c, "key")?);
+        }
+    }
+    if let Some(arr) = state.get("devices").and_then(Json::as_array) {
+        for d in arr {
+            a.register_device(uuid_field(d, "id")?, key32(d, "key")?);
+        }
+    }
+    Ok(a)
+}
+
+fn build_record(j: &Json) -> Result<Record, String> {
+    let kind = RecordType::from_u8(j.get("kind").and_then(Json::as_u64).unwrap_or(255) as u8)
+        .ok_or("unknown record kind")?;
+    let sig_bytes = hex::decode(
+        j.get("signature")
+            .and_then(Json::as_str)
+            .ok_or("the record needs a `signature`")?,
+    )
+    .map_err(|e| format!("signature: {e}"))?;
+    let signature: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "a signature is 64 bytes".to_string())?;
+    Ok(Record {
+        id: uuid_field(j, "id")?,
+        kind,
+        hlc: Hlc(j.get("hlc").and_then(Json::as_u64).unwrap_or(0)),
+        author: uuid_field(j, "author")?,
+        body: hex::decode(j.get("body").and_then(Json::as_str).unwrap_or(""))
+            .map_err(|e| format!("body: {e}"))?,
+        signature,
+    })
+}
+
+fn reject_name(r: &RejectReason) -> &'static str {
+    match r {
+        RejectReason::BadSignature => "bad_signature",
+        RejectReason::UnknownAuthor => "unknown_author",
+        RejectReason::NotItsOwnDeviceRecord => "not_its_own_device_record",
+        RejectReason::WrongAuthority => "wrong_authority",
+        RejectReason::Superseded => "superseded",
+    }
+}
+
+fn records_event(store: &mut Store, authority: &Authority, kind: &str, ev: &Json) -> String {
+    let action = match kind {
+        "accept" => {
+            let rj = ev.get("record").ok_or(()).map_err(|_| ());
+            let Ok(rj) = rj else {
+                return "error accept needs a `record`".to_string();
+            };
+            let record = match build_record(rj) {
+                Ok(r) => r,
+                Err(e) => return format!("error {e}"),
+            };
+            let wall_ms = ev.get("wall_ms").and_then(Json::as_u64).unwrap_or(0);
+            // A real verifier, not a stub. The byte order a signature covers is
+            // the normative part, and a vector checked against a stub would pin
+            // none of it.
+            match store.accept(record, authority, &Ed25519Verifier, wall_ms) {
+                Ok(()) => r#"{"action":"accepted"}"#.to_string(),
+                Err(r) => format!(r#"{{"action":"rejected","reason":"{}"}}"#, reject_name(&r)),
+            }
+        }
+        "digest" => {
+            let entries: Vec<String> = store
+                .digest()
+                .iter()
+                .map(|e| format!(r#"{{"id":"{}","hlc":{}}}"#, hex::encode(&e.id.0), e.hlc.0))
+                .collect();
+            format!(r#"{{"action":"digest","entries":[{}]}}"#, entries.join(","))
+        }
+        "wanted" => {
+            let theirs: Vec<lumen_device::records::DigestEntry> = ev
+                .get("theirs")
+                .and_then(Json::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| {
+                            Some(lumen_device::records::DigestEntry {
+                                id: uuid_field(e, "id").ok()?,
+                                hlc: Hlc(e.get("hlc").and_then(Json::as_u64)?),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ids: Vec<String> = store
+                .wanted(&theirs)
+                .iter()
+                .map(|i| format!("\"{}\"", hex::encode(&i.0)))
+                .collect();
+            format!(r#"{{"action":"wanted","ids":[{}]}}"#, ids.join(","))
+        }
+        other => return format!("error unknown event `{other}` for machine `records`"),
+    };
+    format!("ok {{\"actions\":[{action}]}}")
 }
 
 fn q16_of(j: &Json, key: &str) -> Q16 {
