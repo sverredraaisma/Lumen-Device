@@ -29,6 +29,7 @@
 //! so a source drops back in the moment something above it expires.
 
 use lumen_proto::Uuid;
+use lumen_vm::q16::Q16;
 
 /// The highest priority that may omit an expiry.
 ///
@@ -89,6 +90,34 @@ pub struct Source {
 }
 
 impl Source {
+    /// How much of this source is showing at `now_us`, as a 0..=1 fraction.
+    ///
+    /// `fade_in_ms` was decoded from the wire and then ignored: a source asking
+    /// to arrive over half a second snapped on instantly, and only the fade
+    /// *out* was ever honoured. This is the other half.
+    ///
+    /// Measured from `pushed_at_us`, which is on the **show clock** like every
+    /// other instant the core sees. That is what synchronises a fade across
+    /// devices to the millisecond rather than to whenever each of them happened
+    /// to process the message - as long as the caller sets `pushed_at_us` from
+    /// the pushing message's `show_time_us` and not from its own arrival time.
+    /// A device that anchors it locally still fades correctly; it just fades a
+    /// few milliseconds out of step with its neighbours, which on a wave
+    /// crossing several strips is exactly what is visible.
+    pub fn fade_in_alpha(&self, now_us: u64) -> Q16 {
+        let span = (self.fade_in_ms as u64).saturating_mul(1_000);
+        if span == 0 {
+            return Q16::ONE;
+        }
+        let elapsed = now_us.saturating_sub(self.pushed_at_us);
+        if elapsed >= span {
+            return Q16::ONE;
+        }
+        // The same fixed-point fraction the fade out uses, so the two agree bit
+        // for bit about what half-faded means.
+        Q16(((elapsed * 65_536) / span) as i32)
+    }
+
     /// Whether this source outranks `other` for the same pixel.
     ///
     /// Higher priority first; on a tie the **most recently pushed** wins, which
@@ -780,5 +809,53 @@ mod tests {
             s.advance(step * 1_000, &mut c);
         }
         assert!(c.is_empty(), "a settled stack kept emitting: {c:?}");
+    }
+
+    // ---- Fading in ---------------------------------------------------------
+
+    fn fading_in(fade_in_ms: u16, pushed_at_us: u64) -> Source {
+        let mut s = src(1, 10, None, 10);
+        s.fade_in_ms = fade_in_ms;
+        s.pushed_at_us = pushed_at_us;
+        s
+    }
+
+    #[test]
+    fn a_source_with_no_fade_in_is_fully_present_immediately() {
+        // The overwhelming majority of sources. `fade_in_ms` defaults to zero
+        // and a thing that appears should appear.
+        let s = fading_in(0, 1_000);
+        assert_eq!(s.fade_in_alpha(1_000), Q16::ONE);
+        assert_eq!(s.fade_in_alpha(0), Q16::ONE);
+    }
+
+    #[test]
+    fn a_fade_in_runs_from_nothing_to_everything() {
+        let s = fading_in(1_000, 5_000_000);
+        assert_eq!(s.fade_in_alpha(5_000_000), Q16::ZERO);
+        assert_eq!(s.fade_in_alpha(5_500_000), Q16::HALF);
+        assert_eq!(s.fade_in_alpha(6_000_000), Q16::ONE);
+        // And stays there rather than wrapping or overshooting.
+        assert_eq!(s.fade_in_alpha(60_000_000), Q16::ONE);
+    }
+
+    #[test]
+    fn a_fade_in_that_has_not_started_shows_nothing_rather_than_everything() {
+        // A source pushed with a show time in the future, which is what a
+        // scheduled activation looks like. Saturating the subtraction the wrong
+        // way would make it appear at full brightness early - the one failure
+        // here that is visible from across a room.
+        let s = fading_in(1_000, 10_000_000);
+        assert_eq!(s.fade_in_alpha(9_000_000), Q16::ZERO);
+    }
+
+    #[test]
+    fn the_longest_fade_in_the_wire_format_allows_does_not_overflow() {
+        // `fade_in_ms` is a u16, so just over a minute, and the intermediate
+        // multiply by 65 536 is where a narrower type would have wrapped.
+        let s = fading_in(u16::MAX, 0);
+        assert_eq!(s.fade_in_alpha(0), Q16::ZERO);
+        assert_eq!(s.fade_in_alpha(32_767 * 1_000), Q16(32_767));
+        assert_eq!(s.fade_in_alpha(u16::MAX as u64 * 1_000), Q16::ONE);
     }
 }

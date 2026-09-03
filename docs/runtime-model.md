@@ -55,7 +55,16 @@ The obvious risk of a dynamic limit is that **the same show behaves differently 
 1. **A guaranteed floor.** Every `render` device must support at least **two concurrent sources plus one cross-fading out**. A device that cannot meet the floor at its configured LED count and frame rate must reduce frame rate until it can — the floor is not negotiable, because below it an alert cannot appear over an ambient scene, and that is the whole point of the stack.
 2. **The compiler reports worst-case concurrency per device**, not just per-effect budget. The publish log should state, for each device, how many sources it can carry — so a mixed mesh's weakest member is visible at authoring time rather than discovered during a show.
 
-> **Open question:** does a fade need to be synchronised across devices to the millisecond, or is starting within a frame or two enough? Millisecond sync is nearly free given the show clock, so probably just do it.
+**Fades are synchronised to the millisecond, and it was free.** Every instant the
+core sees is on the show clock, so a fade measured from `pushed_at_us` for a fade
+in, or from `started_at_us` for a fade out, runs in step on every device without
+anything being added to carry it.
+
+What that leaves is a requirement on the caller rather than on the design: a node
+must set `pushed_at_us` from the **pushing message's `show_time_us`**, not from
+its own arrival time. Anchoring it locally still fades correctly, and fades a few
+milliseconds out of step with its neighbours — which is invisible on a room light
+and exactly what tears on a wave crossing several strips.
 
 ## Zones
 

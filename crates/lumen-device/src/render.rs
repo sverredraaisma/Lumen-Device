@@ -183,7 +183,17 @@ impl Renderer {
         });
 
         for b in &order {
-            if self.render_source(now_us, t, leds, b, uniforms, out, &mut report, Q16::ONE) {
+            // Weighted by how far through its fade in it is, which is `Q16::ONE`
+            // for the overwhelming majority of sources - `fade_in_ms` defaults
+            // to zero and most things simply appear.
+            let alpha = b.source.fade_in_alpha(now_us);
+            if alpha <= Q16::ZERO {
+                // Nothing of it is showing yet. Skipping is not only cheaper:
+                // rendering at zero would still charge the source's budget
+                // against the frame for a contribution nobody can see.
+                continue;
+            }
+            if self.render_source(now_us, t, leds, b, uniforms, out, &mut report, alpha) {
                 report.rendered.push(b.source.id);
             }
         }
@@ -848,5 +858,58 @@ mod tests {
         let mut changes = Vec::new();
         stack.push(0, source(1, 10, None), &mut changes).unwrap();
         assert!(changes.iter().any(|c| matches!(c, Change::Admitted(_))));
+    }
+
+    #[test]
+    fn a_source_fading_in_arrives_gradually() {
+        // `fade_in_ms` was decoded from the wire and never used: a source asking
+        // to arrive over a second appeared instantly. This is the render-loop
+        // half of fixing that.
+        let dev = device(4);
+        let (zone, mem) = whole_device(&dev);
+        let bytes = solid(1.0, 1.0, 1.0);
+        let program = Program::parse(&bytes).unwrap();
+
+        let mut src = source(1, 10, None);
+        src.fade_in_ms = 1_000;
+        src.pushed_at_us = 2_000_000;
+
+        let mut stack = SourceStack::new(1_000, 4);
+        let mut changes = Vec::new();
+        stack.push(0, src, &mut changes).unwrap();
+
+        let render_at = |now_us: u64| {
+            let mut out = vec![Rgb::BLACK; 4];
+            let mut r = Renderer::new();
+            let report = r.render(
+                now_us,
+                Q16::ZERO,
+                &dev,
+                &stack,
+                &[Bound {
+                    source: src,
+                    program: &program,
+                    membership: &mem,
+                    projection: zone.projection,
+                }],
+                &mut NoUniforms,
+                &mut out,
+            );
+            (out[0], report)
+        };
+
+        // Before it starts: nothing showing, and nothing charged for it either.
+        let (pixel, report) = render_at(2_000_000);
+        assert_eq!(pixel, Rgb::BLACK);
+        assert!(report.rendered.is_empty(), "rendered before it had arrived");
+
+        // Halfway: over black, half brightness.
+        let (pixel, _) = render_at(2_500_000);
+        assert_eq!(pixel.r, Q16::HALF);
+
+        // Arrived.
+        let (pixel, report) = render_at(3_000_000);
+        assert_eq!(pixel.r, Q16::ONE);
+        assert_eq!(report.rendered, vec![uuid(1)]);
     }
 }
