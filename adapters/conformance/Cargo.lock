@@ -21,6 +21,7 @@ dependencies = [
  "lumen-conformance",
  "lumen-device",
  "lumen-proto",
+ "lumen-vm",
 ]
 
 [[package]]

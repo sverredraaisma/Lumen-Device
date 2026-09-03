@@ -19,9 +19,11 @@ use std::io::{BufRead, Write};
 
 use lumen_conformance::hex;
 use lumen_conformance::json::{parse, Json};
+use lumen_device::channels::{Channel, ClaimOutcome};
 use lumen_device::sources::{Change, PushError, Removal, Source, SourceStack};
 use lumen_device::{Action, Destination, Event, Identity, Node, Role};
 use lumen_proto::Uuid;
+use lumen_vm::q16::Q16;
 
 fn main() {
     let stdin = std::io::stdin();
@@ -57,6 +59,7 @@ enum Machine {
     None,
     Node(Box<Node>),
     Sources(Box<SourceStack>),
+    Channel(Box<Channel>),
 }
 
 fn respond(line: &str, machine: &mut Machine) -> String {
@@ -109,6 +112,17 @@ fn reset(body: &Json, machine: &mut Machine) -> String {
                 .and_then(Json::as_u64)
                 .unwrap_or(0) as usize;
             *machine = Machine::Sources(Box::new(SourceStack::new(budget, max)));
+            "ok {}".to_string()
+        }
+        "channel" => {
+            let id = state.get("channel_id").and_then(Json::as_u64).unwrap_or(0) as u16;
+            let hold_ms = state.get("hold_ms").and_then(Json::as_u64).unwrap_or(0) as u32;
+            // A q16 default arrives as its raw i32, which may be negative.
+            let default = match state.get("default") {
+                Some(Json::Number(t)) => Q16(t.parse::<i64>().unwrap_or(0) as i32),
+                _ => Q16::ZERO,
+            };
+            *machine = Machine::Channel(Box::new(Channel::new(id, hold_ms, default)));
             "ok {}".to_string()
         }
         // Naming a machine this implementation does not have is an `error`, not
@@ -167,7 +181,92 @@ fn event(body: &Json, machine: &mut Machine) -> String {
         Machine::None => "error no machine; send `reset` first".to_string(),
         Machine::Node(node) => node_event(node, at_us, kind, ev),
         Machine::Sources(stack) => sources_event(stack, at_us, kind, ev),
+        Machine::Channel(ch) => channel_event(ch, at_us, kind, ev),
     }
+}
+
+fn producer_of(ev: &Json) -> Result<[u8; 4], String> {
+    let text = ev
+        .get("producer")
+        .and_then(Json::as_str)
+        .ok_or("the event needs a `producer`")?;
+    let b = hex::decode(text).map_err(|e| format!("producer: {e}"))?;
+    b.as_slice()
+        .try_into()
+        .map_err(|_| "a producer is 4 bytes".to_string())
+}
+
+fn channel_event(ch: &mut Channel, at_us: u64, kind: &str, ev: &Json) -> String {
+    let mut actions: Vec<String> = Vec::new();
+    match kind {
+        "claim" => {
+            let producer = match producer_of(ev) {
+                Ok(p) => p,
+                Err(e) => return format!("error {e}"),
+            };
+            let priority = ev.get("priority").and_then(Json::as_u64).unwrap_or(0) as u8;
+            let lease_ms = ev.get("lease_ms").and_then(Json::as_u64).unwrap_or(0) as u32;
+            actions.push(match ch.claim(at_us, producer, priority, lease_ms) {
+                ClaimOutcome::Taken => r#"{"action":"claimed","outcome":"taken"}"#.to_string(),
+                ClaimOutcome::Renewed => r#"{"action":"claimed","outcome":"renewed"}"#.to_string(),
+                ClaimOutcome::Preempted { previous } => format!(
+                    r#"{{"action":"claimed","outcome":"preempted","previous":"{}"}}"#,
+                    hex::encode(&previous)
+                ),
+                ClaimOutcome::Refused { holder } => format!(
+                    r#"{{"action":"claimed","outcome":"refused","holder":"{}"}}"#,
+                    hex::encode(&holder)
+                ),
+            });
+        }
+        "release" => {
+            let producer = match producer_of(ev) {
+                Ok(p) => p,
+                Err(e) => return format!("error {e}"),
+            };
+            // A release from anyone but the owner is ignored, not honoured:
+            // otherwise one packet from any device knocks the desktop app off
+            // the audio channel.
+            actions.push(if ch.release(producer) {
+                r#"{"action":"released"}"#.to_string()
+            } else {
+                r#"{"action":"release_ignored"}"#.to_string()
+            });
+        }
+        "publish" => {
+            let producer = match producer_of(ev) {
+                Ok(p) => p,
+                Err(e) => return format!("error {e}"),
+            };
+            let seq = ev.get("seq").and_then(Json::as_u64).unwrap_or(0) as u16;
+            let value = match ev.get("value") {
+                Some(Json::Number(t)) => Q16(t.parse::<i64>().unwrap_or(0) as i32),
+                _ => Q16::ZERO,
+            };
+            actions.push(if ch.publish(at_us, producer, seq, value) {
+                r#"{"action":"published"}"#.to_string()
+            } else {
+                r#"{"action":"dropped"}"#.to_string()
+            });
+        }
+        "advance" => {
+            if let Some(p) = ch.advance(at_us) {
+                actions.push(format!(
+                    r#"{{"action":"lease_lapsed","producer":"{}"}}"#,
+                    hex::encode(&p)
+                ));
+            }
+        }
+        "read" => {
+            actions.push(format!(
+                r#"{{"action":"value","value":{},"stale":{}}}"#,
+                ch.read(at_us).0,
+                ch.is_stale(at_us)
+            ));
+        }
+        other => return format!("error unknown event `{other}` for machine `channel`"),
+    }
+    format!("ok {{\"actions\":[{}]}}", actions.join(","))
 }
 
 fn node_event(node: &mut Node, at_us: u64, kind: &str, ev: &Json) -> String {
