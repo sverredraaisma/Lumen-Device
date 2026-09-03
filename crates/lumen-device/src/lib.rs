@@ -36,6 +36,7 @@
 
 extern crate alloc;
 
+pub mod audio;
 pub mod channels;
 pub mod election;
 pub mod gateway;

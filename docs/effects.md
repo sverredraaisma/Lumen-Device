@@ -97,6 +97,8 @@ overall level, smoothed level
 onset flag, beat phase 0..1, estimated BPM, confidence
 ```
 
+The byte layout is normative and lives in `lumen-spec/docs/wire-format.md` under `CHAN`; the codec for it is `lumen_proto::audio`, on the permissive side so a desktop app or a phone can feed a mesh without taking on the GPL. The analysis itself — FFT, bands, onset, tempo — is `lumen_device::audio`, and performs no I/O: the shell captures samples and hands them in.
+
 Publishing beat *phase* rather than beat *events* is what makes this work over a lossy network: a receiver that misses a packet can still extrapolate where in the bar it is, so an effect stays on beat instead of stuttering.
 
 Multiple audio sources hand over automatically by claim-and-lease ([[Protocol#Channel ownership]]) — the desktop preempts the room mic when you plug it in, and its lease lapsing hands control back. Note this is a *different* mechanism from the source-stack priority rule, which governs sources on a zone rather than producers of a channel, even though both are priority-and-lease shaped.
