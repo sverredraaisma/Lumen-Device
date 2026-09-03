@@ -97,5 +97,9 @@ The factory-default program sits outside the pool and is never evicted or overwr
 
 ## Open questions
 
-- Per-LED coordinates are **relative to the device root** (decided — a device can then be moved without remapping). Still to define: exactly when world coordinates get recomputed after a root change, and how that interacts with on-device zone re-evaluation ([[Runtime Model#Zones]]), which reads the same values.
+- Per-LED coordinates are **relative to the device root** (decided — a device can then be moved without remapping). World coordinates and zone membership are recomputed together, on the same trigger, **once the device has stopped moving**: `Settling` in `zones.rs` holds the policy.
+
+  A root change and a mapping change both wait half a second of quiet before anything is recomputed, because both arrive from an AR session that emits them continuously while somebody points a phone at the device. A zone record change applies at once, because it is somebody's deliberate act and they are watching the lights to see whether it worked.
+
+  Debounced rather than rate limited, which is the part worth keeping. A rate limit would recompute periodically *during* a move, and every intermediate answer is wrong — showing them in sequence is the flicker the rule exists to prevent. Waiting for quiet shows the old membership throughout the move and the new one once.
 - Does a show need versioning and undo history, or is that only in [[Desktop Application]] and never replicated?

@@ -33,6 +33,111 @@
 use lumen_proto::Uuid;
 use lumen_vm::q16::Q16;
 
+/// Why zone membership might need recomputing.
+///
+/// Separate causes because they settle differently, which is the whole point of
+/// distinguishing them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resettle {
+    /// The device's own root moved.
+    ///
+    /// The flickery one. An AR session refining a position emits these
+    /// continuously for as long as somebody is pointing a phone at the device,
+    /// and each one would otherwise re-resolve every zone.
+    RootMoved,
+    /// The device's LED coordinates or map quality changed.
+    ///
+    /// Arrives from the same AR session as `RootMoved` and for the same reason,
+    /// so it settles the same way.
+    MappingChanged,
+    /// A zone record was created, edited or deleted.
+    ///
+    /// Somebody's deliberate act, so it applies at once. Waiting here would make
+    /// the editor feel broken - a user who has just changed a zone is watching
+    /// the lights to see whether it worked.
+    ZoneChanged,
+}
+
+/// How long a moved device waits for its position to stop changing.
+///
+/// Long enough to cover the gaps between updates in an AR session, short enough
+/// that a device set down on a shelf joins its zones while the person who moved
+/// it is still looking at it.
+pub const SETTLE_US: u64 = 500_000;
+
+/// Decides when zone membership is worth recomputing.
+///
+/// Sans-IO and allocation-free: it takes causes and a clock and answers a
+/// question. The caller does the resolving, which is what keeps this testable
+/// without a device.
+///
+/// # Why debouncing rather than rate limiting
+///
+/// A rate limit would recompute every so often *during* a move, which is the
+/// flicker the rule exists to avoid — the intermediate answers are all wrong and
+/// showing them is worse than showing the stale one. Waiting for quiet means a
+/// device shows its old membership throughout a move and its new membership
+/// once, which is both correct and what a person expects to see.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Settling {
+    pending: bool,
+    /// When the work becomes due. Already past for a cause that does not wait.
+    due_at_us: u64,
+}
+
+impl Settling {
+    pub const fn new() -> Self {
+        Settling {
+            pending: false,
+            due_at_us: 0,
+        }
+    }
+
+    /// Note that something happened which membership depends on.
+    pub fn touch(&mut self, now_us: u64, cause: Resettle) {
+        let due = match cause {
+            Resettle::RootMoved | Resettle::MappingChanged => now_us.saturating_add(SETTLE_US),
+            Resettle::ZoneChanged => now_us,
+        };
+        // The later deadline wins, so a move in progress keeps pushing the work
+        // out — that is the debounce. A `ZoneChanged` arriving mid-move
+        // therefore does *not* pull the recompute forward, which is deliberate:
+        // resolving against a position still being refined would produce an
+        // answer that has to be thrown away, and the move's own deadline is
+        // moments later anyway.
+        self.due_at_us = if self.pending {
+            self.due_at_us.max(due)
+        } else {
+            due
+        };
+        self.pending = true;
+    }
+
+    /// Whether membership should be recomputed now.
+    pub fn is_due(&self, now_us: u64) -> bool {
+        self.pending && now_us >= self.due_at_us
+    }
+
+    /// Whether anything is waiting, due or not.
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// When to wake up, for a caller scheduling a timer.
+    ///
+    /// `None` when nothing is waiting, so a settled device sets no timer and
+    /// stays asleep.
+    pub fn due_at(&self) -> Option<u64> {
+        self.pending.then_some(self.due_at_us)
+    }
+
+    /// Record that the caller has recomputed.
+    pub fn settled(&mut self) {
+        self.pending = false;
+        self.due_at_us = 0;
+    }
+}
+
 /// How much a device's coordinates can be trusted.
 ///
 /// Ordered, so "rough or better" is a comparison rather than a match.
@@ -996,5 +1101,87 @@ mod tests {
         assert_eq!(mem.bounds.span(Axis::X), m(4));
         assert_eq!(mem.bounds.span(Axis::Z), Q16::ZERO);
         assert_eq!(mem.bounds.centre()[0], m(2));
+    }
+
+    // ---- Settling ----------------------------------------------------------
+
+    #[test]
+    fn a_zone_edit_applies_at_once() {
+        // Somebody's deliberate act, and they are watching the lights to see
+        // whether it worked.
+        let mut s = Settling::new();
+        s.touch(1_000, Resettle::ZoneChanged);
+        assert!(s.is_due(1_000));
+        assert_eq!(s.due_at(), Some(1_000));
+    }
+
+    #[test]
+    fn a_moved_device_waits_for_its_position_to_stop_changing() {
+        let mut s = Settling::new();
+        s.touch(0, Resettle::RootMoved);
+        assert!(s.is_pending());
+        assert!(!s.is_due(SETTLE_US - 1));
+        assert!(s.is_due(SETTLE_US));
+    }
+
+    #[test]
+    fn a_move_in_progress_keeps_pushing_the_work_out() {
+        // The debounce, and the reason this type exists. An AR session emits
+        // root changes for as long as somebody points a phone at the device;
+        // recomputing on each is wasted work and visible as flicker.
+        let mut s = Settling::new();
+        s.touch(0, Resettle::RootMoved);
+        for tick in 1..20 {
+            let now = tick * 100_000;
+            s.touch(now, Resettle::RootMoved);
+            assert!(!s.is_due(now), "recomputed mid-move at {now}");
+        }
+        let last = 19 * 100_000;
+        assert!(s.is_due(last + SETTLE_US));
+    }
+
+    #[test]
+    fn a_zone_edit_during_a_move_does_not_pull_the_recompute_forward() {
+        // Resolving against a position still being refined produces an answer
+        // that has to be thrown away, and the move's own deadline is moments
+        // later anyway.
+        let mut s = Settling::new();
+        s.touch(0, Resettle::RootMoved);
+        s.touch(1_000, Resettle::ZoneChanged);
+        assert!(!s.is_due(1_000));
+        assert!(s.is_due(SETTLE_US));
+    }
+
+    #[test]
+    fn a_mapping_change_settles_like_a_move() {
+        // It arrives from the same AR session and for the same reason.
+        let mut s = Settling::new();
+        s.touch(0, Resettle::MappingChanged);
+        assert!(!s.is_due(SETTLE_US - 1));
+        assert!(s.is_due(SETTLE_US));
+    }
+
+    #[test]
+    fn a_settled_device_asks_for_no_timer() {
+        let mut s = Settling::new();
+        assert_eq!(s.due_at(), None);
+        assert!(!s.is_due(u64::MAX));
+
+        s.touch(0, Resettle::RootMoved);
+        assert_eq!(s.due_at(), Some(SETTLE_US));
+        s.settled();
+        assert_eq!(s.due_at(), None);
+        assert!(!s.is_pending());
+    }
+
+    #[test]
+    fn settling_does_not_overflow_at_the_end_of_the_clock() {
+        // The show clock is a u64 of microseconds, so this is not reachable in
+        // practice - but a deadline that wrapped would be immediately due, and
+        // a device would recompute continuously rather than never.
+        let mut s = Settling::new();
+        s.touch(u64::MAX, Resettle::RootMoved);
+        assert_eq!(s.due_at(), Some(u64::MAX));
+        assert!(s.is_due(u64::MAX));
     }
 }

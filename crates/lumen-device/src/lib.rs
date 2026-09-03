@@ -57,7 +57,7 @@ pub use records::{Authority, Hlc, Record, RecordType, Store};
 pub use render::{Renderer, Rgb};
 pub use sources::{Source, SourceStack};
 pub use sync::{Sync, SyncState};
-pub use zones::{MapQuality, Projection, Zone};
+pub use zones::{MapQuality, Projection, Resettle, Settling, Zone};
 
 /// Microseconds on the show clock.
 pub type ShowTimeUs = u64;
