@@ -5,7 +5,7 @@ why the licence boundary sits where it does, the four design rules every change
 is checked against, and how cross-repo protocol changes flow — lives in the
 meta-repo:
 
-  https://github.com/REPLACE-ME/lumen-dev/blob/main/CONTRIBUTING.md
+  https://github.com/sverredraaisma/Lumen-Dev/blob/main/CONTRIBUTING.md
 
 Specific to **lumen-device**: see `README.md` in this directory.
 

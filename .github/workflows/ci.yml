@@ -30,7 +30,7 @@ jobs:
       # fail at manifest parse rather than at anything interesting.
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/lumen-core
+          repository: ${{ github.repository_owner }}/Lumen-Core
           path: lumen-core
           ref: main
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +64,7 @@ jobs:
       # fail at manifest parse rather than at anything interesting.
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/lumen-core
+          repository: ${{ github.repository_owner }}/Lumen-Core
           path: lumen-core
           ref: main
       - uses: dtolnay/rust-toolchain@stable
