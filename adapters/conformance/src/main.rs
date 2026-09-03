@@ -20,7 +20,11 @@ use std::io::{BufRead, Write};
 use lumen_conformance::hex;
 use lumen_conformance::json::{parse, Json};
 use lumen_device::channels::{Channel, ClaimOutcome};
+use lumen_device::gateway::{
+    admit, Binding, BindingError, Ingress, Protocol, Refusal, MAX_GATEWAY_PRIORITY,
+};
 use lumen_device::sources::{Change, PushError, Removal, Source, SourceStack};
+use lumen_device::zones::{Axis, Clause, CmpOp, DeviceLeds, Led, MapQuality, Predicate, Zone};
 use lumen_device::{Action, Destination, Event, Identity, Node, Role};
 use lumen_proto::Uuid;
 use lumen_vm::q16::Q16;
@@ -60,6 +64,12 @@ enum Machine {
     Node(Box<Node>),
     Sources(Box<SourceStack>),
     Channel(Box<Channel>),
+    /// The gateway policy is a pure function rather than a state machine, so
+    /// what a vector resets is the binding it is judged against.
+    Gateway(Box<Option<Binding>>),
+    /// Zone resolution is a pure function of a zone and one device's LEDs, so
+    /// a vector resets both together.
+    Zone(Box<(Zone, DeviceLeds)>),
 }
 
 fn respond(line: &str, machine: &mut Machine) -> String {
@@ -125,6 +135,20 @@ fn reset(body: &Json, machine: &mut Machine) -> String {
             *machine = Machine::Channel(Box::new(Channel::new(id, hold_ms, default)));
             "ok {}".to_string()
         }
+        "gateway" => {
+            *machine = Machine::Gateway(Box::new(match build_binding(state) {
+                Ok(b) => Some(b),
+                Err(e) => return format!("error {e}"),
+            }));
+            "ok {}".to_string()
+        }
+        "zone" => match build_zone_state(state) {
+            Ok(z) => {
+                *machine = Machine::Zone(Box::new(z));
+                "ok {}".to_string()
+            }
+            Err(e) => format!("error {e}"),
+        },
         // Naming a machine this implementation does not have is an `error`, not
         // a `reject`: the adapter failed to answer, rather than the
         // implementation refusing something.
@@ -182,6 +206,263 @@ fn event(body: &Json, machine: &mut Machine) -> String {
         Machine::Node(node) => node_event(node, at_us, kind, ev),
         Machine::Sources(stack) => sources_event(stack, at_us, kind, ev),
         Machine::Channel(ch) => channel_event(ch, at_us, kind, ev),
+        Machine::Gateway(binding) => gateway_event(binding, at_us, kind, ev),
+        Machine::Zone(z) => zone_event(&z.0, &z.1, kind),
+    }
+}
+
+fn q16_of(j: &Json, key: &str) -> Q16 {
+    match j.get(key) {
+        Some(Json::Number(t)) => Q16(t.parse::<i64>().unwrap_or(0) as i32),
+        _ => Q16::ZERO,
+    }
+}
+
+fn triple(j: &Json, key: &str) -> [Q16; 3] {
+    let Some(arr) = j.get(key).and_then(Json::as_array) else {
+        return [Q16::ZERO; 3];
+    };
+    let mut out = [Q16::ZERO; 3];
+    for (i, v) in arr.iter().take(3).enumerate() {
+        if let Json::Number(t) = v {
+            out[i] = Q16(t.parse::<i64>().unwrap_or(0) as i32);
+        }
+    }
+    out
+}
+
+fn build_predicate(j: &Json) -> Result<Predicate, String> {
+    match j.get("predicate").and_then(Json::as_str) {
+        Some("compare") => {
+            let axis = match j.get("axis").and_then(Json::as_str) {
+                Some("x") => Axis::X,
+                Some("y") => Axis::Y,
+                Some("z") => Axis::Z,
+                other => return Err(format!("unknown axis {other:?}")),
+            };
+            let op = match j.get("op").and_then(Json::as_str) {
+                Some("lt") => CmpOp::Lt,
+                Some("le") => CmpOp::Le,
+                Some("gt") => CmpOp::Gt,
+                Some("ge") => CmpOp::Ge,
+                other => return Err(format!("unknown comparison {other:?}")),
+            };
+            Ok(Predicate::Compare {
+                axis,
+                op,
+                value: q16_of(j, "value"),
+            })
+        }
+        Some("near") => Ok(Predicate::Near {
+            point: triple(j, "point"),
+            radius: q16_of(j, "radius"),
+        }),
+        Some("not") => {
+            let inner = j.get("of").ok_or("`not` needs an `of`")?;
+            Ok(Predicate::Not(alloc_box(build_predicate(inner)?)))
+        }
+        Some(k @ ("all" | "any")) => {
+            let arr = j
+                .get("of")
+                .and_then(Json::as_array)
+                .ok_or("needs an `of` array")?;
+            let parts: Result<Vec<Predicate>, String> = arr.iter().map(build_predicate).collect();
+            let parts = parts?;
+            Ok(if k == "all" {
+                Predicate::All(parts)
+            } else {
+                Predicate::Any(parts)
+            })
+        }
+        other => Err(format!("unknown predicate {other:?}")),
+    }
+}
+
+fn alloc_box(p: Predicate) -> Box<Predicate> {
+    Box::new(p)
+}
+
+fn build_clause(j: &Json) -> Result<Clause, String> {
+    match j.get("clause").and_then(Json::as_str) {
+        Some("device") => {
+            let leds = j.get("leds").and_then(Json::as_array).map(|a| {
+                let g = |i: usize| a.get(i).and_then(Json::as_u64).unwrap_or(0) as u16;
+                (g(0), g(1))
+            });
+            Ok(Clause::Device {
+                device: uuid_field(j, "device")?,
+                leds,
+            })
+        }
+        Some("where") => Ok(Clause::Where(build_predicate(j)?)),
+        other => Err(format!("unknown clause {other:?}")),
+    }
+}
+
+fn build_zone_state(state: &Json) -> Result<(Zone, DeviceLeds), String> {
+    let zj = state.get("zone").ok_or("state.zone is missing")?;
+    let clauses = |key: &str| -> Result<Vec<Clause>, String> {
+        match zj.get(key).and_then(Json::as_array) {
+            Some(a) => a.iter().map(build_clause).collect(),
+            None => Ok(Vec::new()),
+        }
+    };
+    let zone = Zone {
+        id: uuid_field(zj, "id")?,
+        include: clauses("include")?,
+        exclude: clauses("exclude")?,
+        // Membership does not depend on the projection, and these vectors are
+        // about membership. Strip is the default and the one an unmapped device
+        // uses, so it is the honest placeholder rather than an arbitrary one.
+        projection: lumen_device::zones::Projection::Strip,
+    };
+
+    let dj = state.get("device").ok_or("state.device is missing")?;
+    let quality = match dj.get("quality").and_then(Json::as_str) {
+        Some("synthetic") => MapQuality::Synthetic,
+        Some("rough") => MapQuality::Rough,
+        Some("mapped") => MapQuality::Mapped,
+        other => return Err(format!("unknown mapping quality {other:?}")),
+    };
+    let leds = dj
+        .get("leds")
+        .and_then(Json::as_array)
+        .ok_or("state.device.leds is missing")?
+        .iter()
+        .map(|l| Led {
+            index: l.get("index").and_then(Json::as_u64).unwrap_or(0) as u16,
+            world: triple(l, "world"),
+            local: triple(l, "local"),
+        })
+        .collect();
+
+    Ok((
+        zone,
+        DeviceLeds {
+            device: uuid_field(dj, "device")?,
+            quality,
+            leds,
+        },
+    ))
+}
+
+fn zone_event(zone: &Zone, dev: &DeviceLeds, kind: &str) -> String {
+    match kind {
+        "resolve" => {
+            let m = zone.resolve(dev);
+            let leds: Vec<String> = m.leds.iter().map(|i| i.to_string()).collect();
+            format!(
+                "ok {{\"actions\":[{{\"action\":\"selected\",\"leds\":[{}]}}]}}",
+                leds.join(",")
+            )
+        }
+        "why_excluded" => format!(
+            "ok {{\"actions\":[{{\"action\":\"excluded_for_mapping\",\"excluded\":{}}}]}}",
+            zone.excluded_for_mapping(dev)
+        ),
+        other => format!("error unknown event `{other}` for machine `zone`"),
+    }
+}
+
+fn protocol_of(name: &str) -> Result<Protocol, String> {
+    Ok(match name {
+        "artnet" => Protocol::ArtNet,
+        "e131" => Protocol::E131,
+        "ddp" => Protocol::Ddp,
+        "mqtt" => Protocol::Mqtt,
+        "http" => Protocol::Http,
+        other => return Err(format!("unknown protocol `{other}`")),
+    })
+}
+
+fn build_binding(state: &Json) -> Result<Binding, String> {
+    let protocol = protocol_of(
+        state
+            .get("protocol")
+            .and_then(Json::as_str)
+            .ok_or("state.protocol is missing")?,
+    )?;
+    let from = state.get("pixel_from").and_then(Json::as_u64).unwrap_or(0) as u16;
+    let to = state.get("pixel_to").and_then(Json::as_u64).unwrap_or(0) as u16;
+    Ok(Binding {
+        id: uuid_field(state, "id")?,
+        protocol,
+        zone: uuid_field(state, "zone")?,
+        pixels: (from, to),
+        priority_ceiling: state
+            .get("priority_ceiling")
+            .and_then(Json::as_u64)
+            .ok_or("state.priority_ceiling is missing")? as u8,
+    })
+}
+
+fn render_binding_error(e: &BindingError) -> String {
+    match e {
+        BindingError::CeilingTooHigh { asked, max } => format!(
+            r#"{{"action":"bad_binding","reason":"ceiling_too_high","asked":{asked},"max":{max}}}"#
+        ),
+        BindingError::EmptyRange => {
+            r#"{"action":"bad_binding","reason":"empty_range"}"#.to_string()
+        }
+    }
+}
+
+fn gateway_event(binding: &Option<Binding>, at_us: u64, kind: &str, ev: &Json) -> String {
+    let Some(binding) = binding else {
+        return "error no binding; send `reset` first".to_string();
+    };
+    match kind {
+        "ingress" => {
+            let ingress = Ingress {
+                offset: ev.get("offset").and_then(Json::as_u64).unwrap_or(0) as u16,
+                count: ev.get("count").and_then(Json::as_u64).unwrap_or(0) as u16,
+                // Absent means the protocol carries no priority at all, which
+                // is not the same as asking for zero.
+                priority: ev.get("priority").and_then(Json::as_u64).map(|v| v as u8),
+            };
+            let id = match uuid_field(ev, "source_id") {
+                Ok(u) => u,
+                Err(e) => return format!("error {e}"),
+            };
+            let action = match admit(binding, &ingress, id, at_us) {
+                Ok(a) => format!(
+                    concat!(
+                        r#"{{"action":"admitted","pixel_from":{},"pixel_to":{},"clipped":{},"#,
+                        r#""priority":{},"priority_clamped":{},"expires_at_us":{}}}"#
+                    ),
+                    a.pixels.0,
+                    a.pixels.1,
+                    a.clipped,
+                    a.source.priority,
+                    a.priority_clamped,
+                    // Every gateway source gets a lease whether it asked for one
+                    // or not, so this is never absent.
+                    match a.source.expires_at_us {
+                        Some(v) => v.to_string(),
+                        None => "null".to_string(),
+                    }
+                ),
+                Err(Refusal::OutsideBinding) => {
+                    r#"{"action":"refused","reason":"outside_binding"}"#.to_string()
+                }
+                Err(Refusal::BadBinding(e)) => render_binding_error(&e),
+            };
+            format!("ok {{\"actions\":[{action}]}}")
+        }
+        "program" => {
+            // Not a question with two answers. A program is signed code that
+            // runs on every device, and taking one from an unauthenticated
+            // channel would make the signing pointless.
+            let g = lumen_device::gateway::Gateway::new();
+            format!(
+                "ok {{\"actions\":[{{\"action\":\"program_accepted\",\"accepted\":{}}}]}}",
+                g.accepts_programs()
+            )
+        }
+        "ceiling" => format!(
+            "ok {{\"actions\":[{{\"action\":\"max_priority\",\"max\":{MAX_GATEWAY_PRIORITY}}}]}}"
+        ),
+        other => format!("error unknown event `{other}` for machine `gateway`"),
     }
 }
 
