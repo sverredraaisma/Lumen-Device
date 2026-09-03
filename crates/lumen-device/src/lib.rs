@@ -55,6 +55,7 @@ pub use election::{Candidacy, Election, Role};
 pub use gateway::{Binding, Gateway};
 pub use keepers::{Claim, Quorum};
 pub use node::Node;
+pub use records::Reconcile;
 pub use records::{Authority, Hlc, Record, RecordType, Store};
 pub use render::{Renderer, Rgb};
 pub use sources::{Source, SourceStack};

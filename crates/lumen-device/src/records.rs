@@ -275,6 +275,34 @@ pub struct DigestEntry {
     pub hlc: Hlc,
 }
 
+/// What a gossip round should do, having compared two digests.
+///
+/// Both directions from one comparison, because a round is symmetric: whichever
+/// node sent the digest, both ends learn the same set of differences and either
+/// can act. That is what lets a `STATE_DIGEST` be answered with a single
+/// `STATE_PULL` and a single `STATE_PUSH` instead of a negotiation.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Reconcile {
+    /// Records to ask the peer for: it has them and this node does not, or its
+    /// copy is newer.
+    pub pull: Vec<Uuid>,
+    /// Records to send the peer: this node has them and the peer does not, or
+    /// this copy is newer.
+    pub push: Vec<Uuid>,
+}
+
+impl Reconcile {
+    /// Whether the two nodes already agree.
+    ///
+    /// The overwhelmingly common outcome. A mesh at rest gossips every five
+    /// seconds and finds nothing every time, which is why the digest is a
+    /// compact list of ids and clocks rather than anything that has to be
+    /// verified — a steady-state round costs no signature checks at all.
+    pub fn is_empty(&self) -> bool {
+        self.pull.is_empty() && self.push.is_empty()
+    }
+}
+
 /// The replicated store.
 #[derive(Clone, Default, Debug)]
 pub struct Store {
@@ -351,6 +379,61 @@ impl Store {
                 hlc: r.hlc,
             })
             .collect()
+    }
+
+    /// Compare this store against a peer's digest, in both directions.
+    ///
+    /// [`Store::wanted`] answers half of this — what to pull — and is what a
+    /// node uses when it only has to answer a digest. This answers the other
+    /// half too, which is what a node running the round needs: a peer that is
+    /// *behind* will never ask, so without the push half a record reaches a
+    /// stale node only when that node happens to gossip first.
+    ///
+    /// Ordered by id in both directions, so two nodes handed the same pair of
+    /// digests produce the same plan and a recorded round replays.
+    ///
+    /// **An equal clock means agreement, and nothing is transferred.** A hybrid
+    /// logical clock is unique to the edit that produced it, so two records
+    /// sharing one are the same record; if they were not, no amount of
+    /// transferring would settle which to keep, and that is the conflict
+    /// [`Authority`] resolves when a record actually arrives rather than
+    /// something a digest can see.
+    pub fn reconcile(&self, theirs: &[DigestEntry]) -> Reconcile {
+        // The pull half is `wanted`, not a second copy of it. A digest is not
+        // promised to be free of duplicates, so this sorts and dedupes on top -
+        // pulling the same record twice is a wasted round trip rather than a
+        // fault, but a plan that lists it twice is one a test cannot compare.
+        let mut pull = self.wanted(theirs);
+        pull.sort_unstable();
+        pull.dedup();
+
+        // The push half: what this node holds that the peer lacks or is behind
+        // on. Indexed rather than scanned, because a digest arrives ordered by
+        // id but nothing in the protocol obliges a peer to send it that way.
+        let mut peer: BTreeMap<Uuid, Hlc> = BTreeMap::new();
+        for entry in theirs {
+            // A duplicated id is not conforming. Keeping the newer is the
+            // reading that cannot lose an edit.
+            peer.entry(entry.id)
+                .and_modify(|h| {
+                    if entry.hlc > *h {
+                        *h = entry.hlc;
+                    }
+                })
+                .or_insert(entry.hlc);
+        }
+        let push = self
+            .records
+            .iter()
+            .filter(|(id, record)| match peer.get(*id) {
+                Some(theirs) => record.hlc > *theirs,
+                None => true,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        // `self.records` is a `BTreeMap`, so the pushes are already in id order.
+        Reconcile { pull, push }
     }
 
     /// Which of a peer's records this node wants, given their digest.
@@ -894,5 +977,138 @@ mod tests {
         assert!(empty.digest().is_empty());
         let theirs = populated(&[(1, 10), (2, 20)]);
         assert_eq!(empty.wanted(&theirs.digest()).len(), 2);
+    }
+
+    // ---- Reconciling a gossip round ----------------------------------------
+
+    fn digest_of(entries: &[(u8, u64)]) -> Vec<DigestEntry> {
+        entries
+            .iter()
+            .map(|(id, hlc)| DigestEntry {
+                id: uuid(*id),
+                hlc: Hlc(*hlc),
+            })
+            .collect()
+    }
+
+    /// A store holding exactly `entries`, at the clocks given.
+    ///
+    /// Built through `accept` rather than by reaching into the map, so these
+    /// tests exercise a store that was populated the way a real one is.
+    fn store_of(entries: &[(u8, u64)]) -> Store {
+        let a = authority();
+        let mut s = Store::new();
+        for (id, hlc) in entries {
+            // Authored by the controller and signed with its key, which is what
+            // the shared `authority()` fixture authorises for a scene.
+            s.accept(
+                signed(*id, RecordType::Scene, *hlc, 200, 7),
+                &a,
+                &KeyMatches,
+                *hlc,
+            )
+            .expect("the fixture record is acceptable");
+        }
+        s
+    }
+
+    #[test]
+    fn two_nodes_that_agree_transfer_nothing() {
+        // The common case by an enormous margin: a mesh at rest gossips every
+        // five seconds and finds nothing every time.
+        let mine = store_of(&[(1, 100), (2, 200)]);
+        let plan = mine.reconcile(&digest_of(&[(1, 100), (2, 200)]));
+        assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_record_only_the_peer_has_is_pulled() {
+        let mine = store_of(&[(1, 100)]);
+        let plan = mine.reconcile(&digest_of(&[(1, 100), (2, 50)]));
+        assert_eq!(plan.pull, alloc::vec![uuid(2)]);
+        assert!(plan.push.is_empty());
+    }
+
+    #[test]
+    fn a_record_only_this_node_has_is_pushed() {
+        let mine = store_of(&[(1, 100), (2, 50)]);
+        let plan = mine.reconcile(&digest_of(&[(1, 100)]));
+        assert_eq!(plan.push, alloc::vec![uuid(2)]);
+        assert!(plan.pull.is_empty());
+    }
+
+    #[test]
+    fn the_newer_clock_decides_which_way_a_record_moves() {
+        let mine = store_of(&[(1, 100), (2, 100)]);
+        let plan = mine.reconcile(&digest_of(&[(1, 200), (2, 50)]));
+        assert_eq!(plan.pull, alloc::vec![uuid(1)]);
+        assert_eq!(plan.push, alloc::vec![uuid(2)]);
+    }
+
+    #[test]
+    fn a_peer_that_is_behind_is_pushed_to_without_asking() {
+        // The case the push half exists for, and the one the conformance
+        // vectors originally missed: a node that is behind never sends a pull,
+        // so if the round did not push, that record would reach it only if it
+        // happened to gossip first. Convergence would depend on who spoke.
+        let mine = store_of(&[(1, 200)]);
+        let plan = mine.reconcile(&digest_of(&[(1, 100)]));
+        assert_eq!(plan.push, alloc::vec![uuid(1)]);
+        assert!(plan.pull.is_empty());
+    }
+
+    #[test]
+    fn an_equal_clock_means_the_same_record() {
+        // An HLC is unique to the edit that produced it, so two records sharing
+        // one are the same record. If they were not, transferring would not
+        // settle which to keep - that is the conflict `Authority` resolves when
+        // a record arrives, not something a digest can see.
+        let mine = store_of(&[(1, 100)]);
+        assert!(mine.reconcile(&digest_of(&[(1, 100)])).is_empty());
+    }
+
+    #[test]
+    fn a_node_that_has_just_joined_pulls_everything() {
+        let mine = Store::new();
+        let plan = mine.reconcile(&digest_of(&[(3, 30), (1, 10), (2, 20)]));
+        assert_eq!(plan.pull, alloc::vec![uuid(1), uuid(2), uuid(3)]);
+        assert!(plan.push.is_empty());
+    }
+
+    #[test]
+    fn a_plan_is_ordered_so_two_nodes_produce_the_same_one() {
+        // Reproducibility, which is what makes a gossip round testable and a
+        // recorded run replayable. A peer is not obliged by anything in the
+        // protocol to send its digest in order.
+        let mine = store_of(&[(5, 10), (1, 10), (9, 10)]);
+        let plan = mine.reconcile(&digest_of(&[(8, 10), (2, 10), (4, 10)]));
+        assert_eq!(plan.push, alloc::vec![uuid(1), uuid(5), uuid(9)]);
+        assert_eq!(plan.pull, alloc::vec![uuid(2), uuid(4), uuid(8)]);
+    }
+
+    #[test]
+    fn a_duplicated_id_in_a_digest_keeps_the_newer_clock() {
+        // Not conforming, but the reading that cannot lose an edit: treating the
+        // older one as authoritative would leave this node believing it is up to
+        // date when it is not.
+        let mine = store_of(&[(1, 100)]);
+        assert_eq!(
+            mine.reconcile(&digest_of(&[(1, 50), (1, 200)])).pull,
+            alloc::vec![uuid(1)]
+        );
+        assert!(mine.reconcile(&digest_of(&[(1, 200), (1, 50)])).pull.len() == 1);
+    }
+
+    #[test]
+    fn an_empty_digest_from_a_peer_pushes_everything() {
+        let mine = store_of(&[(1, 10), (2, 20)]);
+        let plan = mine.reconcile(&[]);
+        assert_eq!(plan.push, alloc::vec![uuid(1), uuid(2)]);
+        assert!(plan.pull.is_empty());
+    }
+
+    #[test]
+    fn two_empty_stores_have_nothing_to_say() {
+        assert!(Store::new().reconcile(&[]).is_empty());
     }
 }

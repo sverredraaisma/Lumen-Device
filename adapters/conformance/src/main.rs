@@ -524,20 +524,7 @@ fn records_event(store: &mut Store, authority: &Authority, kind: &str, ev: &Json
             format!(r#"{{"action":"digest","entries":[{}]}}"#, entries.join(","))
         }
         "wanted" => {
-            let theirs: Vec<lumen_device::records::DigestEntry> = ev
-                .get("theirs")
-                .and_then(Json::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|e| {
-                            Some(lumen_device::records::DigestEntry {
-                                id: uuid_field(e, "id").ok()?,
-                                hlc: Hlc(e.get("hlc").and_then(Json::as_u64)?),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let theirs = digest_from(ev);
             let ids: Vec<String> = store
                 .wanted(&theirs)
                 .iter()
@@ -545,9 +532,41 @@ fn records_event(store: &mut Store, authority: &Authority, kind: &str, ev: &Json
                 .collect();
             format!(r#"{{"action":"wanted","ids":[{}]}}"#, ids.join(","))
         }
+        "reconcile" => {
+            let theirs = digest_from(ev);
+            let plan = store.reconcile(&theirs);
+            let ids = |v: &[Uuid]| {
+                v.iter()
+                    .map(|i| format!("\"{}\"", hex::encode(&i.0)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            format!(
+                r#"{{"action":"reconcile","pull":[{}],"push":[{}]}}"#,
+                ids(&plan.pull),
+                ids(&plan.push)
+            )
+        }
         other => return format!("error unknown event `{other}` for machine `records`"),
     };
     format!("ok {{\"actions\":[{action}]}}")
+}
+
+/// A peer's digest, from a vector's `theirs` field.
+fn digest_from(ev: &Json) -> Vec<lumen_device::records::DigestEntry> {
+    ev.get("theirs")
+        .and_then(Json::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    Some(lumen_device::records::DigestEntry {
+                        id: uuid_field(e, "id").ok()?,
+                        hlc: Hlc(e.get("hlc").and_then(Json::as_u64)?),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn q16_of(j: &Json, key: &str) -> Q16 {
