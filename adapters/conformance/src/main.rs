@@ -25,11 +25,14 @@ use lumen_device::gateway::{
     admit, Binding, BindingError, Ingress, Protocol, Refusal, MAX_GATEWAY_PRIORITY,
 };
 use lumen_device::records::{Authority, Hlc, Record, RecordType, RejectReason, Store};
+use lumen_device::render::{Bound, RenderFault, Renderer, Rgb};
 use lumen_device::sources::{Change, PushError, Removal, Source, SourceStack};
 use lumen_device::zones::{Axis, Clause, CmpOp, DeviceLeds, Led, MapQuality, Predicate, Zone};
 use lumen_device::{Action, Destination, Event, Identity, Node, Role};
 use lumen_proto::Uuid;
+use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
+use lumen_vm::vm::NoUniforms;
 
 fn main() {
     let stdin = std::io::stdin();
@@ -73,6 +76,26 @@ enum Machine {
     /// a vector resets both together.
     Zone(Box<(Zone, DeviceLeds)>),
     Records(Box<(Store, Authority)>),
+    Render(Box<RenderState>),
+}
+
+/// What a `render` vector accumulates: a stack, the device's LEDs, and one
+/// owned program per bound source.
+///
+/// The bytecode is owned here because `Bound` borrows a parsed `Program`, which
+/// in turn borrows the bytes. Parsing per frame rather than holding the parsed
+/// form keeps those lifetimes local to one call.
+struct RenderState {
+    renderer: Renderer,
+    stack: SourceStack,
+    leds: DeviceLeds,
+    bound: Vec<BoundSource>,
+}
+
+struct BoundSource {
+    source: Source,
+    bytecode: Vec<u8>,
+    membership: lumen_device::zones::Membership,
 }
 
 fn respond(line: &str, machine: &mut Machine) -> String {
@@ -159,6 +182,24 @@ fn reset(body: &Json, machine: &mut Machine) -> String {
             }
             Err(e) => format!("error {e}"),
         },
+        "render" => {
+            let budget = state
+                .get("budget")
+                .and_then(Json::as_u64)
+                .unwrap_or(u32::MAX as u64) as u32;
+            let max = state
+                .get("max_concurrent")
+                .and_then(Json::as_u64)
+                .unwrap_or(8) as usize;
+            let count = state.get("led_count").and_then(Json::as_u64).unwrap_or(4) as u16;
+            *machine = Machine::Render(Box::new(RenderState {
+                renderer: Renderer::new(),
+                stack: SourceStack::new(budget, max),
+                leds: strip_of(count),
+                bound: Vec::new(),
+            }));
+            "ok {}".to_string()
+        }
         // Naming a machine this implementation does not have is an `error`, not
         // a `reject`: the adapter failed to answer, rather than the
         // implementation refusing something.
@@ -219,7 +260,145 @@ fn event(body: &Json, machine: &mut Machine) -> String {
         Machine::Gateway(binding) => gateway_event(binding, at_us, kind, ev),
         Machine::Zone(z) => zone_event(&z.0, &z.1, kind),
         Machine::Records(r) => records_event(&mut r.0, &r.1, kind, ev),
+        Machine::Render(r) => render_event(r, at_us, kind, ev),
     }
+}
+
+/// A synthetic strip: `count` LEDs in a line, one metre apart.
+fn strip_of(count: u16) -> DeviceLeds {
+    DeviceLeds {
+        device: Uuid([0xDD; 16]),
+        // Rough rather than synthetic, so a geometric zone would be meaningful
+        // here even though these vectors do not use one.
+        quality: MapQuality::Rough,
+        leds: (0..count)
+            .map(|i| Led {
+                index: i,
+                world: [Q16::from_int(i as i16), Q16::ZERO, Q16::ZERO],
+                local: [Q16::from_int(i as i16), Q16::ZERO, Q16::ZERO],
+            })
+            .collect(),
+    }
+}
+
+fn render_event(st: &mut RenderState, at_us: u64, kind: &str, ev: &Json) -> String {
+    match kind {
+        "bind" => {
+            let bytecode = match hex::decode(ev.get("program").and_then(Json::as_str).unwrap_or(""))
+            {
+                Ok(b) => b,
+                Err(e) => return format!("error program: {e}"),
+            };
+            let source = match build_source(ev, at_us) {
+                Ok(s) => s,
+                Err(e) => return format!("error {e}"),
+            };
+            // The membership comes from resolving a real zone rather than
+            // being assembled here: `Bounds` is computed by that resolution and
+            // is not the adapter's to invent, and a hand-built one would let a
+            // projection be normalised over a range no zone ever produced.
+            let from = ev.get("led_from").and_then(Json::as_u64).unwrap_or(0) as u16;
+            let to = ev
+                .get("led_to")
+                .and_then(Json::as_u64)
+                .unwrap_or(st.leds.leds.len() as u64) as u16;
+            let zone = Zone {
+                id: source.zone,
+                include: vec![Clause::Device {
+                    device: st.leds.device,
+                    leds: Some((from, to)),
+                }],
+                exclude: Vec::new(),
+                projection: lumen_device::zones::Projection::Strip,
+            };
+            let membership = zone.resolve(&st.leds);
+
+            let mut changes = Vec::new();
+            let refused = st.stack.push(at_us, source, &mut changes).err();
+            st.bound.push(BoundSource {
+                source,
+                bytecode,
+                membership,
+            });
+
+            let mut actions: Vec<String> = changes.iter().map(render_change).collect();
+            if let Some(e) = refused {
+                actions.push(render_push_error(&e));
+            }
+            format!("ok {{\"actions\":[{}]}}", actions.join(","))
+        }
+        "frame" => {
+            let t = match ev.get("t") {
+                Some(Json::Number(x)) => Q16(x.parse::<i64>().unwrap_or(0) as i32),
+                _ => Q16::ZERO,
+            };
+
+            // Parse every program first: `Bound` borrows them, so they have to
+            // outlive the render call.
+            let mut programs = Vec::new();
+            for b in &st.bound {
+                match Program::parse(&b.bytecode) {
+                    Ok(p) => programs.push(p),
+                    Err(e) => return format!("error a bound program does not parse: {e:?}"),
+                }
+            }
+            let bound: Vec<Bound<'_>> = st
+                .bound
+                .iter()
+                .zip(programs.iter())
+                .map(|(b, p)| Bound {
+                    source: b.source,
+                    program: p,
+                    membership: &b.membership,
+                    projection: lumen_device::zones::Projection::Strip,
+                })
+                .collect();
+
+            // The buffer starts black so the vector can tell "nothing wrote
+            // here" apart from "something wrote black".
+            let mut out = alloc_pixels(st.leds.leds.len());
+            let report = st.renderer.render(
+                at_us,
+                t,
+                &st.leds,
+                &st.stack,
+                &bound,
+                &mut NoUniforms,
+                &mut out,
+            );
+
+            let pixels: Vec<String> = out
+                .iter()
+                .map(|p| format!("[{},{},{}]", p.r.0, p.g.0, p.b.0))
+                .collect();
+            let mut actions: Vec<String> = Vec::new();
+            actions.push(format!(
+                r#"{{"action":"pixels","rgb":[{}]}}"#,
+                pixels.join(",")
+            ));
+            for f in &report.faults {
+                let RenderFault::Program { source, .. } = f;
+                actions.push(format!(
+                    r#"{{"action":"faulted","source":"{}"}}"#,
+                    hex::encode(&source.0)
+                ));
+            }
+            format!("ok {{\"actions\":[{}]}}", actions.join(","))
+        }
+        "advance" => {
+            let mut changes = Vec::new();
+            st.stack.advance(at_us, &mut changes);
+            let actions: Vec<String> = changes.iter().map(render_change).collect();
+            format!("ok {{\"actions\":[{}]}}", actions.join(","))
+        }
+        other => format!("error unknown event `{other}` for machine `render`"),
+    }
+}
+
+fn alloc_pixels(n: usize) -> Vec<Rgb> {
+    (0..n)
+        .map(|_| Rgb::new(Q16::ZERO, Q16::ZERO, Q16::ZERO))
+        .collect()
 }
 
 fn key32(j: &Json, key: &str) -> Result<[u8; 32], String> {
