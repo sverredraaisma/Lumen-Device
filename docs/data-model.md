@@ -36,7 +36,13 @@ Cost is about 64 bytes per record and one verify per record on gossip receive. V
 
 ## Replication
 
-Keepers are **elected, and capped at 5–7** ([[Firmware#Roles]]), ranked by flash size then capacity score. Everyone else pulls the records they need read-only and caches them. A bridged RP2040 is never a keeper.
+Keepers are **capped at 5** ([[Firmware#Roles]]), ranked by flash size then capacity score. Everyone else pulls the records they need read-only and caches them. A bridged RP2040 is never a keeper: it reaches the mesh through another device, so keeping records there puts a hop in front of them and takes them offline whenever the bridge reboots.
+
+**There is no election protocol, and that is the point.** Every device already knows the peer table, so ranking it is a pure function and every device reaches the same keeper set independently, with no messages exchanged and nothing to disagree about. A timebase election needs messages because it must converge on *one* device and a split brain tears the show; a keeper set must converge on a *set*, changes only when the peer table does, and a device briefly wrong about it pulls a record from a non-keeper — which works, because a non-keeper holding the record serves it. The cost of being wrong is a wasted round trip, and paying for a protocol to prevent that is the wrong trade.
+
+Five rather than the seven the range allowed, because gossip is the cost: every keeper sends a digest every five seconds, so traffic grows with the *number of keepers* and not with the size of the mesh. Five leaves two spare copies beyond the three that make a healed partition converge.
+
+The ranking is a **total order with no ties** — flash, then capacity, then UUID. That last term is not a detail: two strips flashed from one binary report identical flash and identical capacity, and if that were a tie two devices could sort the same table differently and disagree about the keeper set forever. It is the one failure this design cannot detect, because it has no protocol in which to notice.
 
 - **Gossip.** Every 5 s a keeper sends a `STATE_DIGEST` to a random peer: a compact list of record id to HLC. Differences trigger `STATE_PULL` and `STATE_PUSH`.
 - **Conflict resolution.** Last writer wins per record, ordered by HLC then author key as a tiebreak. Deliberately simple. Records are small and edits are rare and human-driven, so the pathological cases that motivate real CRDTs do not arise here.

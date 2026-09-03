@@ -24,6 +24,7 @@ use lumen_device::channels::{Channel, ClaimOutcome};
 use lumen_device::gateway::{
     admit, Binding, BindingError, Ingress, Protocol, Refusal, MAX_GATEWAY_PRIORITY,
 };
+use lumen_device::keepers::{self, Claim, Quorum};
 use lumen_device::records::{Authority, Hlc, Record, RecordType, RejectReason, Store};
 use lumen_device::render::{Bound, RenderFault, Renderer, Rgb};
 use lumen_device::sources::{Change, PushError, Removal, Source, SourceStack};
@@ -77,6 +78,9 @@ enum Machine {
     Zone(Box<(Zone, DeviceLeds)>),
     Records(Box<(Store, Authority)>),
     Render(Box<RenderState>),
+    /// Keeper selection is a pure function of the peer table, so a vector resets
+    /// the table it is judged against.
+    Keepers(Vec<Claim>),
 }
 
 /// What a `render` vector accumulates: a stack, the device's LEDs, and one
@@ -182,6 +186,30 @@ fn reset(body: &Json, machine: &mut Machine) -> String {
             }
             Err(e) => format!("error {e}"),
         },
+        "keepers" => {
+            let mut claims = Vec::new();
+            if let Some(Json::Array(peers)) = state.get("peers") {
+                for p in peers {
+                    let Some(uuid) = p.get("uuid").and_then(Json::as_str) else {
+                        return "error a peer needs a `uuid`".to_string();
+                    };
+                    let uuid = match uuid_of(uuid) {
+                        Ok(u) => u,
+                        Err(e) => return format!("error {e}"),
+                    };
+                    claims.push(Claim {
+                        uuid,
+                        flash_kib: p.get("flash_kib").and_then(Json::as_u64).unwrap_or(0) as u32,
+                        capacity: p.get("capacity").and_then(Json::as_u64).unwrap_or(0) as u32,
+                        // Eligible unless a vector says otherwise: a bridged
+                        // node is the exception, not the rule.
+                        eligible: p.get("eligible").and_then(Json::as_bool).unwrap_or(true),
+                    });
+                }
+            }
+            *machine = Machine::Keepers(claims);
+            "ok {}".to_string()
+        }
         "render" => {
             let budget = state
                 .get("budget")
@@ -233,11 +261,16 @@ fn uuid_field(state: &Json, key: &str) -> Result<Uuid, String> {
         .get(key)
         .and_then(Json::as_str)
         .ok_or_else(|| format!("state.{key} is missing"))?;
-    let bytes = hex::decode(text).map_err(|e| format!("state.{key}: {e}"))?;
+    uuid_of(text).map_err(|e| format!("state.{key}: {e}"))
+}
+
+/// A UUID from its hex text.
+fn uuid_of(text: &str) -> Result<Uuid, String> {
+    let bytes = hex::decode(text).map_err(|e| e.to_string())?;
     let arr: [u8; 16] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| format!("state.{key} must be 16 bytes, got {}", bytes.len()))?;
+        .map_err(|_| format!("a uuid must be 16 bytes, got {}", bytes.len()))?;
     Ok(Uuid(arr))
 }
 
@@ -261,6 +294,7 @@ fn event(body: &Json, machine: &mut Machine) -> String {
         Machine::Zone(z) => zone_event(&z.0, &z.1, kind),
         Machine::Records(r) => records_event(&mut r.0, &r.1, kind, ev),
         Machine::Render(r) => render_event(r, at_us, kind, ev),
+        Machine::Keepers(claims) => keepers_event(claims, kind, ev),
     }
 }
 
@@ -666,6 +700,46 @@ fn zone_event(zone: &Zone, dev: &DeviceLeds, kind: &str) -> String {
             zone.excluded_for_mapping(dev)
         ),
         other => format!("error unknown event `{other}` for machine `zone`"),
+    }
+}
+
+fn keepers_event(claims: &mut [Claim], kind: &str, ev: &Json) -> String {
+    match kind {
+        "select" => {
+            let (count, quorum) = keepers::select(claims);
+            let chosen: Vec<String> = claims[..count]
+                .iter()
+                .map(|c| format!("\"{}\"", hex::encode(&c.uuid.0)))
+                .collect();
+            format!(
+                "ok {{\"actions\":[{{\"action\":\"keepers\",\"chosen\":[{}],\"quorum\":\"{}\"}}]}}",
+                chosen.join(","),
+                quorum_name(quorum)
+            )
+        }
+        "is_keeper" => {
+            let Some(uuid) = ev.get("uuid").and_then(Json::as_str) else {
+                return "error `is_keeper` needs a `uuid`".to_string();
+            };
+            let uuid = match uuid_of(uuid) {
+                Ok(u) => u,
+                Err(e) => return format!("error {e}"),
+            };
+            format!(
+                "ok {{\"actions\":[{{\"action\":\"is_keeper\",\"keeper\":{}}}]}}",
+                keepers::is_keeper(claims, uuid)
+            )
+        }
+        other => format!("error unknown event `{other}` for machine `keepers`"),
+    }
+}
+
+fn quorum_name(q: Quorum) -> &'static str {
+    match q {
+        Quorum::Healthy => "healthy",
+        Quorum::Thin => "thin",
+        Quorum::Fragile => "fragile",
+        Quorum::None => "none",
     }
 }
 
