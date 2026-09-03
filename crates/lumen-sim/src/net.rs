@@ -27,9 +27,14 @@ pub type NodeId = u16;
 
 /// Largest datagram the simulated fabric will carry.
 ///
-/// 1200 rather than 1500: the wire format assumes 1200-byte payloads survive
-/// tunnels, and a simulator that happily carried 1400 bytes would let a bug
-/// through that only appears on someone's VPN.
+/// The wire format fixes this at 1200, and `the_simulated_fabric_carries_what_
+/// the_wire_format_allows` asserts the two agree. Restated rather than imported
+/// because the codec is a dev-dependency here: the simulated network moves
+/// bytes and never looks inside them, and pulling the codec into the library to
+/// borrow one integer would be the wrong trade.
+///
+/// A simulator that happily delivered 1400 bytes would pass a bug that only
+/// ever appears on somebody's VPN.
 pub const MTU: usize = 1200;
 
 /// The port every simulated node listens on.
@@ -603,6 +608,15 @@ mod tests {
             out.push(buf[..len].to_vec());
         }
         out
+    }
+
+    #[test]
+    fn the_simulated_fabric_carries_what_the_wire_format_allows() {
+        // The one place these two numbers are compared. A simulator that
+        // carried more than the real network would let a datagram through that
+        // fragments or is dropped on somebody's tunnel, and every scenario
+        // would keep passing.
+        assert_eq!(MTU, lumen_proto::header::MAX_DATAGRAM);
     }
 
     #[test]
