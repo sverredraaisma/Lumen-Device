@@ -69,13 +69,15 @@ Full list of what that bans, and why it is worth the friction:
 
 > Living section. Add anything that cost real time.
 
-- **Local coverage does not work on this machine.** The `windows-gnu` toolchain
-  ships no profiler runtime, so `cargo llvm-cov` fails with "the compiler may have
-  been built without the profiler runtime". The gate that counts runs in CI on
-  Linux. Installing the VS Build Tools C++ workload fixes this and the linker.
-- **The default toolchain on this machine cannot link.** MSVC's `link.exe` is not
-  installed; use `cargo +stable-x86_64-pc-windows-gnu ...`. Inside Git Bash,
-  `/usr/bin/link` also shadows it even when it is installed.
+- **The "cannot link / no local coverage" note used to be wrong; both now work.**
+  `link.exe` was never missing. What was missing was the **Windows SDK**, so the
+  linker had no `kernel32.lib` to link against and Rust reported that as
+  "linker `link.exe` not found". Adding the SDK component to the existing VS
+  2022 install fixed the MSVC toolchain and `cargo llvm-cov` together. If a
+  fresh machine shows this symptom, install the C++ workload rather than
+  switching to `windows-gnu`: that workaround builds, which is why nobody
+  revisits it, and it silently costs you coverage because the `windows-gnu`
+  toolchain ships no profiler runtime.
 - **The render clock never steps.** Disciplining it means slewing. A step is a
   visible glitch, and the wall clock is a separate, optional concern.
 - **`lumen-hal` is a path dependency on a sibling checkout**, not a crates.io

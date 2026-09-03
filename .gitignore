@@ -5,3 +5,7 @@ Cargo.lock.orig
 .DS_Store
 .idea/
 .vscode/
+
+# Coverage output. `cargo llvm-cov --lcov` drops this in the repo root;
+# CI uploads it as an artifact and it is never a source file.
+lcov.info
