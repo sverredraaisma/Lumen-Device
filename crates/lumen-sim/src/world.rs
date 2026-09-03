@@ -592,10 +592,7 @@ impl World {
         let mut worked = false;
         let mut buf = [0u8; MTU];
         for id in ids {
-            loop {
-                let Some(node) = self.nodes.get_mut(&id) else {
-                    break;
-                };
+            while let Some(node) = self.nodes.get_mut(&id) {
                 if !node.powered {
                     break;
                 }
