@@ -467,6 +467,12 @@ impl Renderer {
 
         let count = b.membership.bounds.count;
         let mut contributed = false;
+        // Accumulated per pixel, because `Machine::spent` reports the *last*
+        // invocation rather than a running total. Reading it once after the loop
+        // charges the frame for one pixel and reports a device rendering three
+        // hundred as though it had rendered one - which is a budget figure that
+        // says a device is fine right up until it visibly is not.
+        let mut pixel_spent = 0u32;
         for (ordinal, index) in b.membership.leds.iter().enumerate() {
             // `ordinal` still counts every LED of the membership, shard or no
             // shard: it is what the projection maps along, so skipping one must
@@ -505,7 +511,11 @@ impl Renderer {
                 prev,
             };
 
-            match machine.run_pixel(b.program, &inputs, uniforms) {
+            let outcome = machine.run_pixel(b.program, &inputs, uniforms);
+            // Charged whether it succeeded or faulted: a pixel that ran out of
+            // budget spent the budget it ran out of.
+            pixel_spent = pixel_spent.saturating_add(machine.spent());
+            match outcome {
                 Ok(output) => {
                     self.history
                         .insert((b.source.id, *index), machine.prev_out());
@@ -535,7 +545,7 @@ impl Renderer {
         report.spent = report
             .spent
             .saturating_add(frame_spent)
-            .saturating_add(machine.spent());
+            .saturating_add(pixel_spent);
         contributed
     }
 }
@@ -641,9 +651,13 @@ mod tests {
     /// history, so a comparison cannot pass by rendering one flat colour and
     /// cannot pass while feeding a shard the wrong pixel's `prev` either.
     fn ramp_with_history() -> Vec<u8> {
-        use lumen_vm::vm::{R_PREV, R_U};
+        use lumen_vm::vm::{R_PREV, R_T, R_U};
         let mut p = ProgramBuilder::new();
         let half = p.constant(Q16::HALF);
+        // A frame section that actually does something, so every shard running
+        // it for itself is exercised rather than assumed - and so the cost of
+        // that duplication is a number a test can see.
+        p.push(Section::Frame, Instruction::new(OpCode::Sqrt, 25, R_T, 0));
         p.push(Section::Pixel, Instruction::new(OpCode::Mov, 20, R_U, 0));
         // blue = (prev.r + u) / 2, which converges to a different value on
         // every LED and only after several frames.
@@ -984,6 +998,79 @@ mod tests {
         // And the frame section's cost is still reported, not lost when the
         // limit was reset for the pixels.
         assert!(report.spent > program.budget * 4);
+    }
+
+    #[test]
+    fn a_frame_reports_what_every_pixel_cost_not_what_the_last_one_did() {
+        // Spike S5 caught this on hardware: a device rendering thirty LEDs
+        // reported 391 units a frame, which is one pixel's worth. A device sizes
+        // its frame from this number, so under-reporting by the length of the
+        // strip is a budget that says everything is fine right until the light
+        // visibly stutters.
+        let dev = device(8);
+        let (zone, mem) = whole_device(&dev);
+        let bytes = solid(1.0, 0.5, 0.0);
+        let program = Program::parse(&bytes).unwrap();
+
+        let mut stack = SourceStack::new(100_000, 4);
+        let src = source(1, 10, None);
+        stack.push(0, src, &mut Vec::new()).unwrap();
+
+        let bound = [Bound {
+            source: src,
+            program: &program,
+            membership: &mem,
+            projection: zone.projection,
+        }];
+
+        let mut one = Renderer::new();
+        let mut out1 = vec![Rgb::BLACK; 8];
+        let eight = one
+            .render(
+                0,
+                Q16::ZERO,
+                &dev,
+                &stack,
+                &bound,
+                &mut NoUniforms,
+                &mut out1,
+            )
+            .spent;
+
+        // The same program over half as many LEDs costs about half as much.
+        // Exactly half is not asserted: the frame section is paid once either
+        // way, and that is the part that does not scale.
+        let dev4 = device(4);
+        let (zone4, mem4) = whole_device(&dev4);
+        let bound4 = [Bound {
+            source: src,
+            program: &program,
+            membership: &mem4,
+            projection: zone4.projection,
+        }];
+        let mut other = Renderer::new();
+        let mut out2 = vec![Rgb::BLACK; 4];
+        let four = other
+            .render(
+                0,
+                Q16::ZERO,
+                &dev4,
+                &stack,
+                &bound4,
+                &mut NoUniforms,
+                &mut out2,
+            )
+            .spent;
+
+        assert!(
+            eight > four,
+            "eight LEDs reported {eight}, four reported {four}"
+        );
+        assert!(
+            eight >= program.budget * 8,
+            "eight pixels at {} units each reported only {eight}",
+            program.budget
+        );
     }
 
     #[test]
