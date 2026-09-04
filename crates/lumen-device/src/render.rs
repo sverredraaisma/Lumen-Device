@@ -17,12 +17,33 @@
 //! the pixel showing what was underneath rather than black; a pixel no source
 //! covers keeps its ambient value; a source still fading contributes until it
 //! has finished. Nothing takes a pixel to zero by accident.
+//!
+//! # Splitting the work across cores
+//!
+//! The pixels of a frame are independent, so a device with more than one core
+//! can render them on all of them. [`Shard`] is how: each core takes a
+//! [`Renderer`], a shard, and the slice of the output its shard covers.
+//!
+//! No thread appears here, and none may. This crate performs no I/O and owns no
+//! clock, which is what buys deterministic replay and conformance tests that
+//! need no hardware; spending that on a speed-up available to a minority of
+//! chips would be a bad trade. What the crate provides is the *seam* - the
+//! firmware decides how many cores go through it, and
+//! `slice::split_at_mut` hands each one its own output with no sharing, no
+//! locking and no copy.
+//!
+//! Shards must render exactly what one whole render does. That is not a
+//! nicety: a two-core device that rendered differently from a one-core device
+//! would break the mesh's agreement with itself, which is the property every
+//! other decision in this project is arranged to protect.
+//! `shards_render_what_one_whole_does` holds it down, over several frames so
+//! per-pixel history is covered too.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use lumen_proto::Uuid;
-use lumen_vm::program::Program;
+use lumen_vm::program::{Program, Section};
 use lumen_vm::q16::Q16;
 use lumen_vm::vm::{Machine, PixelInputs, PixelOutput, Uniforms};
 use lumen_vm::Fault;
@@ -105,6 +126,143 @@ pub struct FrameReport {
     pub spent: u32,
 }
 
+impl FrameReport {
+    /// Fold another core's report into this one.
+    ///
+    /// `spent` sums, and that total is genuinely higher than a single-core
+    /// render of the same frame would report: each shard runs the `frame`
+    /// section for itself. That is the price of the split and it is small - the
+    /// `frame` section is the part that runs once against the hundreds of pixels
+    /// that do not - but it is real, and reporting it as though it were free
+    /// would turn the one number a device uses to know whether it is keeping up
+    /// into a number that lies.
+    pub fn merge(&mut self, other: FrameReport) {
+        for id in other.rendered {
+            if !self.rendered.contains(&id) {
+                self.rendered.push(id);
+            }
+        }
+        self.faults.extend(other.faults);
+        self.spent = self.spent.saturating_add(other.spent);
+    }
+}
+
+/// The run of LEDs one core renders.
+///
+/// A device with `n` cores builds `n` of these over its LED count, gives each
+/// core one along with its own [`Renderer`] and the matching slice of the output
+/// buffer, and merges the reports afterwards. Together they render exactly what
+/// [`Shard::whole`] renders alone.
+///
+/// # Each core needs its own `Renderer`
+///
+/// The VM's register file survives from `frame` into every pixel of that frame -
+/// which is the whole reason hoisting pays - so two cores sharing one machine
+/// would be two cores writing one register file. The per-LED history is keyed by
+/// LED, and shards own disjoint LEDs, so nothing there is shared either.
+///
+/// # Why every shard runs the `frame` section
+///
+/// A shard's renderer runs `frame` for itself rather than receiving hoisted
+/// registers from a neighbour. The section is a pure function of the program and
+/// `t`, so every shard computes the same registers, and buying that with a
+/// little duplicated arithmetic is far cheaper than the alternative: handing a
+/// live `Machine` between cores means shared mutable state, a barrier between
+/// the frame section and the pixels, and a crate that could no longer be tested
+/// without threads.
+///
+/// The exception is a probe build. `Uniforms::probe` is the one method on that
+/// trait taking `&mut self`, so a probe would be recorded once per shard. Probe
+/// builds render whole.
+///
+/// # Contiguous, and what that costs
+///
+/// A shard is a *run* of LED indices rather than every `n`th LED, so the output
+/// buffer splits with `split_at_mut` and each core writes its own memory. An
+/// interleaved split would balance an uneven effect better - a mask skips work,
+/// an `if` takes one arm, and cost is not uniform along a strip - but it would
+/// leave two cores writing alternating slots of one buffer, which is a shared
+/// mutable buffer however carefully it is described.
+///
+/// So the imbalance is real and is the accepted cost: an effect that lights only
+/// the first half of a strip gets no speed-up from a second core. It is bounded
+/// by never being *slower* than one core, and the common case - an effect
+/// covering the whole strip - splits evenly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shard {
+    first: u16,
+    len: u16,
+}
+
+impl Shard {
+    /// One core doing all of it, over a device with `len` LEDs. What
+    /// [`Renderer::render`] uses, and what a single-core device renders.
+    pub const fn whole(len: u16) -> Shard {
+        Shard { first: 0, len }
+    }
+
+    /// Shard `index` of `of`, over a device with `len` LEDs.
+    ///
+    /// `None` if that is not a share of anything: zero shards, or an index
+    /// outside them. Checked rather than clamped, because a firmware that
+    /// computes a shard wrongly has a bug in how it counts its cores, and
+    /// clamping would turn that into a strip where some LEDs render twice and
+    /// others never - which looks like a broken effect and sends the next person
+    /// to read the compiler.
+    ///
+    /// The remainder goes to the earlier shards, so with 301 LEDs across two
+    /// cores one takes 151 and the other 150. Every LED belongs to exactly one
+    /// shard, which is the property that matters; a shard may be empty when
+    /// there are fewer LEDs than cores.
+    pub fn new(index: u16, of: u16, len: u16) -> Option<Shard> {
+        if of == 0 || index >= of {
+            return None;
+        }
+        let (base, extra) = (len / of, len % of);
+        let count = base + u16::from(index < extra);
+        let first = index * base + index.min(extra);
+        Some(Shard { first, len: count })
+    }
+
+    /// The first LED index this shard owns.
+    pub fn first(self) -> u16 {
+        self.first
+    }
+
+    /// How many LEDs it owns, and so how long its output slice must be.
+    pub fn len(self) -> u16 {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Where LED `index` lands in this shard's output slice, if it owns it.
+    fn slot(self, index: u16) -> Option<usize> {
+        let offset = index.checked_sub(self.first)?;
+        (offset < self.len).then_some(offset as usize)
+    }
+}
+
+/// The LED with this index, without walking the whole strip to find it.
+///
+/// A device's LEDs are its own list in its own order, so in principle this is a
+/// search. In practice a strip is `0..n` in order, and the index *is* the
+/// position - so try that first and fall back to the search when a device is
+/// laid out some other way.
+///
+/// The fallback was the only path until Spike S4 measured it: a linear scan per
+/// pixel is quadratic in the strip, and at 300 LEDs it cost about as much per
+/// frame as running the effect did. That is the shape of thing that never shows
+/// up on a four-LED test and decides what a real device can drive.
+fn find_led(leds: &DeviceLeds, index: u16) -> Option<&crate::zones::Led> {
+    match leds.leds.get(index as usize) {
+        Some(led) if led.index == index => Some(led),
+        _ => leds.leds.iter().find(|l| l.index == index),
+    }
+}
+
 /// Renders one device's LEDs.
 ///
 /// Holds a machine per source, because the VM's register file survives from
@@ -161,6 +319,35 @@ impl Renderer {
         uniforms: &mut U,
         out: &mut [Rgb],
     ) -> FrameReport {
+        let shard = Shard::whole(out.len().min(u16::MAX as usize) as u16);
+        self.render_shard(now_us, t, leds, stack, bound, uniforms, out, shard)
+    }
+
+    /// Render this core's run of LEDs into `out`.
+    ///
+    /// For a device rendering on more than one core. `out` is this shard's own
+    /// slice - `Shard::len` entries, starting at `Shard::first` - so two cores
+    /// hold the two halves of one buffer from `split_at_mut` and neither can
+    /// reach the other's pixels.
+    ///
+    /// Fold the reports together with [`FrameReport::merge`] once the cores have
+    /// joined.
+    ///
+    /// A slice shorter than the shard renders what fits rather than panicking.
+    /// A frame is a soft real-time thing produced sixty times a second; a
+    /// mis-sized buffer should cost some pixels, not the device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_shard<U: Uniforms>(
+        &mut self,
+        now_us: u64,
+        t: Q16,
+        leds: &DeviceLeds,
+        stack: &SourceStack,
+        bound: &[Bound<'_>],
+        uniforms: &mut U,
+        out: &mut [Rgb],
+        shard: Shard,
+    ) -> FrameReport {
         let mut report = FrameReport {
             rendered: Vec::new(),
             faults: Vec::new(),
@@ -193,7 +380,7 @@ impl Renderer {
                 // against the frame for a contribution nobody can see.
                 continue;
             }
-            if self.render_source(now_us, t, leds, b, uniforms, out, &mut report, alpha) {
+            if self.render_source(now_us, t, leds, b, uniforms, out, &mut report, alpha, shard) {
                 report.rendered.push(b.source.id);
             }
         }
@@ -210,7 +397,17 @@ impl Renderer {
             if remaining <= Q16::ZERO {
                 continue;
             }
-            self.render_source(now_us, t, leds, b, uniforms, out, &mut report, remaining);
+            self.render_source(
+                now_us,
+                t,
+                leds,
+                b,
+                uniforms,
+                out,
+                &mut report,
+                remaining,
+                shard,
+            );
         }
 
         report
@@ -228,13 +425,30 @@ impl Renderer {
         out: &mut [Rgb],
         report: &mut FrameReport,
         alpha: Q16,
+        shard: Shard,
     ) -> bool {
         if b.membership.is_empty() {
             return false;
         }
+        // Nothing of this source falls in this shard's run, so not even the
+        // frame section is worth running: no pixel of it would read the
+        // registers the section hoists.
+        if !b.membership.leds.iter().any(|i| shard.slot(*i).is_some()) {
+            return false;
+        }
         let machine = self.machines.entry(b.source.id).or_default();
-        machine.set_budget(b.program.budget.max(1));
 
+        // The `frame` section gets its own allowance, not the per-pixel one.
+        //
+        // The header's `budget` is the cost of the *pixel* section - it is what
+        // a device multiplies by its LED count to decide whether it can afford a
+        // source. Spending it on the frame section instead charges the one part
+        // of a program designed to be expensive against the allowance for the
+        // part designed to be cheap, and faults exactly the effects that hoist
+        // most: which is to say, the well-written ones. Spike S4 caught
+        // `07-alert` failing this way on hardware, every frame, rendering
+        // nothing at all.
+        machine.set_budget(b.program.section_cost(Section::Frame).max(1));
         if let Err(fault) = machine.run_frame_at(b.program, t, uniforms) {
             report.faults.push(RenderFault::Program {
                 source: b.source.id,
@@ -246,13 +460,25 @@ impl Renderer {
             return false;
         }
 
+        let frame_spent = machine.spent();
+        // And the pixels are charged what the program promised per pixel, which
+        // is the number the budget check at publish time was computed against.
+        machine.set_budget(b.program.budget.max(1));
+
         let count = b.membership.bounds.count;
         let mut contributed = false;
         for (ordinal, index) in b.membership.leds.iter().enumerate() {
-            let Some(led) = leds.leds.iter().find(|l| l.index == *index) else {
+            // `ordinal` still counts every LED of the membership, shard or no
+            // shard: it is what the projection maps along, so skipping one must
+            // not renumber the rest. A shard renders fewer pixels, never
+            // different ones - and that is the whole equivalence.
+            let Some(offset) = shard.slot(*index) else {
                 continue;
             };
-            let Some(slot) = out.get_mut(*index as usize) else {
+            let Some(led) = find_led(leds, *index) else {
+                continue;
+            };
+            let Some(slot) = out.get_mut(offset) else {
                 continue;
             };
             let projected = b
@@ -304,7 +530,12 @@ impl Renderer {
                 }
             }
         }
-        report.spent = report.spent.saturating_add(machine.spent());
+        // `spent` is per invocation, so the frame section's share has to be
+        // carried across the pixel loop rather than read back at the end.
+        report.spent = report
+            .spent
+            .saturating_add(frame_spent)
+            .saturating_add(machine.spent());
         contributed
     }
 }
@@ -315,7 +546,6 @@ mod tests {
     use alloc::vec;
     use lumen_vm::isa::{Instruction, OpCode};
     use lumen_vm::program::builder::ProgramBuilder;
-    use lumen_vm::program::Section;
     use lumen_vm::vm::NoUniforms;
 
     use crate::sources::Change;
@@ -405,6 +635,355 @@ mod tests {
             pushed_at_us: 0,
             cost: 10,
         }
+    }
+
+    /// A program whose colour varies along the strip *and* feeds back its own
+    /// history, so a comparison cannot pass by rendering one flat colour and
+    /// cannot pass while feeding a shard the wrong pixel's `prev` either.
+    fn ramp_with_history() -> Vec<u8> {
+        use lumen_vm::vm::{R_PREV, R_U};
+        let mut p = ProgramBuilder::new();
+        let half = p.constant(Q16::HALF);
+        p.push(Section::Pixel, Instruction::new(OpCode::Mov, 20, R_U, 0));
+        // blue = (prev.r + u) / 2, which converges to a different value on
+        // every LED and only after several frames.
+        p.push(
+            Section::Pixel,
+            Instruction::new(OpCode::Add, 21, 20, R_PREV),
+        );
+        p.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 22, half),
+        );
+        p.push(Section::Pixel, Instruction::new(OpCode::Mul, 21, 21, 22));
+        p.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 20, 20, 21),
+        );
+        p.build()
+    }
+
+    /// One admitted source covering a whole device of `n` LEDs.
+    fn one_source_over(n: u16) -> (DeviceLeds, Zone, Membership, SourceStack, Source, Vec<u8>) {
+        let dev = device(n);
+        let (zone, mem) = whole_device(&dev);
+        let mut stack = SourceStack::new(1_000, 4);
+        let src = source(1, 10, None);
+        stack.push(0, src, &mut Vec::new()).unwrap();
+        (dev, zone, mem, stack, src, ramp_with_history())
+    }
+
+    #[test]
+    fn a_shard_of_one_is_the_whole_device() {
+        assert_eq!(Shard::whole(300), Shard::new(0, 1, 300).unwrap());
+        let one = Shard::whole(300);
+        assert_eq!((one.first(), one.len()), (0, 300));
+        assert!(!one.is_empty());
+    }
+
+    #[test]
+    fn shards_tile_the_strip_with_no_gap_and_no_overlap() {
+        // The property that actually matters: every LED belongs to exactly one
+        // shard. A gap is a dark run on the strip; an overlap is two cores
+        // writing one slot, which is the bug this whole design exists to avoid.
+        for len in [0u16, 1, 2, 5, 60, 299, 300, 301] {
+            for of in [1u16, 2, 3, 4, 8] {
+                let mut covered = vec![0u8; len as usize];
+                let mut next = 0u16;
+                for k in 0..of {
+                    let shard = Shard::new(k, of, len).expect("a real share");
+                    assert_eq!(shard.first(), next, "shards must abut: len {len}, {k}/{of}");
+                    next += shard.len();
+                    for i in shard.first()..shard.first() + shard.len() {
+                        covered[i as usize] += 1;
+                    }
+                }
+                assert_eq!(next, len, "shards must cover the strip: len {len}, of {of}");
+                assert!(
+                    covered.iter().all(|c| *c == 1),
+                    "len {len}, of {of}: {covered:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_remainder_goes_to_the_earliest_shards() {
+        // 301 across two cores is 151 and 150, not 150 and 150 with one LED
+        // nobody renders.
+        assert_eq!(Shard::new(0, 2, 301).unwrap().len(), 151);
+        assert_eq!(Shard::new(1, 2, 301).unwrap().len(), 150);
+        assert_eq!(Shard::new(1, 2, 301).unwrap().first(), 151);
+    }
+
+    #[test]
+    fn more_cores_than_leds_leaves_some_with_nothing() {
+        let last = Shard::new(3, 4, 2).unwrap();
+        assert!(last.is_empty());
+        assert_eq!(last.first(), 2);
+    }
+
+    #[test]
+    fn a_shard_that_is_not_a_share_of_anything_is_refused() {
+        // Clamping would give a strip where some LEDs render twice and others
+        // never, which looks like a broken effect rather than a miscounted core.
+        assert!(Shard::new(0, 0, 300).is_none());
+        assert!(Shard::new(2, 2, 300).is_none());
+        assert!(Shard::new(9, 4, 300).is_none());
+    }
+
+    #[test]
+    fn shards_render_what_one_whole_does() {
+        // The claim the whole multicore design rests on, checked rather than
+        // asserted. If this ever differs, a two-core device renders a different
+        // show from a one-core device and the mesh stops agreeing with itself -
+        // which is worse than being slow, and would stay invisible until two
+        // kinds of device shared one room.
+        //
+        // Four frames, because one would not exercise the per-LED history: a
+        // shard feeding back the wrong pixel's `prev` passes a single-frame
+        // comparison and drifts apart from the second frame on.
+        const FRAMES: u32 = 4;
+        let (dev, zone, mem, stack, src, bytes) = one_source_over(24);
+        let program = Program::parse(&bytes).unwrap();
+        let bound = [Bound {
+            source: src,
+            program: &program,
+            membership: &mem,
+            projection: zone.projection,
+        }];
+
+        let mut whole_r = Renderer::new();
+        let mut whole = vec![Rgb::BLACK; 24];
+        for f in 0..FRAMES {
+            let t = Q16::from_ratio(f as i32, 60);
+            whole_r.render(
+                f as u64 * 16_667,
+                t,
+                &dev,
+                &stack,
+                &bound,
+                &mut NoUniforms,
+                &mut whole,
+            );
+        }
+
+        for of in [2u16, 3, 4, 5] {
+            let mut renderers: Vec<Renderer> = (0..of).map(|_| Renderer::new()).collect();
+            let mut out = vec![Rgb::BLACK; 24];
+
+            for f in 0..FRAMES {
+                let t = Q16::from_ratio(f as i32, 60);
+                // Exactly what a firmware does: hand each core its own run of
+                // the buffer. No sharing, no locking, no copy.
+                let mut rest: &mut [Rgb] = &mut out;
+                for (k, r) in renderers.iter_mut().enumerate() {
+                    let shard = Shard::new(k as u16, of, 24).unwrap();
+                    let (mine, tail) = rest.split_at_mut(shard.len() as usize);
+                    rest = tail;
+                    r.render_shard(
+                        f as u64 * 16_667,
+                        t,
+                        &dev,
+                        &stack,
+                        &bound,
+                        &mut NoUniforms,
+                        mine,
+                        shard,
+                    );
+                }
+                assert!(rest.is_empty(), "the shards did not consume the buffer");
+            }
+
+            assert_eq!(out, whole, "{of} shards rendered a different frame");
+        }
+
+        // And the comparison is not vacuous: the strip is neither flat nor
+        // black, so an all-zero render could not have passed it.
+        assert_ne!(whole[0], whole[23]);
+        assert_ne!(whole[23], Rgb::BLACK);
+    }
+
+    #[test]
+    fn merged_reports_name_every_source_once() {
+        let (dev, zone, mem, stack, src, bytes) = one_source_over(8);
+        let program = Program::parse(&bytes).unwrap();
+        let bound = [Bound {
+            source: src,
+            program: &program,
+            membership: &mem,
+            projection: zone.projection,
+        }];
+
+        let mut whole_r = Renderer::new();
+        let mut whole_out = vec![Rgb::BLACK; 8];
+        let single = whole_r.render(
+            0,
+            Q16::ZERO,
+            &dev,
+            &stack,
+            &bound,
+            &mut NoUniforms,
+            &mut whole_out,
+        );
+
+        let mut merged = FrameReport {
+            rendered: Vec::new(),
+            faults: Vec::new(),
+            spent: 0,
+        };
+        let mut out = vec![Rgb::BLACK; 8];
+        let mut rest: &mut [Rgb] = &mut out;
+        for k in 0..2u16 {
+            let shard = Shard::new(k, 2, 8).unwrap();
+            let (mine, tail) = rest.split_at_mut(shard.len() as usize);
+            rest = tail;
+            let mut r = Renderer::new();
+            merged.merge(r.render_shard(
+                0,
+                Q16::ZERO,
+                &dev,
+                &stack,
+                &bound,
+                &mut NoUniforms,
+                mine,
+                shard,
+            ));
+        }
+
+        // The source rendered on both cores, and is named once.
+        assert_eq!(merged.rendered, single.rendered);
+        assert!(merged.faults.is_empty());
+        // Spend is higher, not equal: each shard ran the frame section. A
+        // device sizing its frame needs the true figure, not the flattering
+        // one - see the doc comment on `merge`.
+        assert!(
+            merged.spent > single.spent,
+            "merged {} vs whole {}",
+            merged.spent,
+            single.spent
+        );
+    }
+
+    #[test]
+    fn a_shard_owning_none_of_a_source_does_not_run_its_frame_section() {
+        // A source covering only the front of the strip must cost the back core
+        // nothing at all - not even the frame section, whose hoisted registers
+        // no pixel of that core would read.
+        let (dev, zone, mut mem, stack, src, bytes) = one_source_over(8);
+        mem.leds.retain(|i| *i < 4);
+        let program = Program::parse(&bytes).unwrap();
+        let bound = [Bound {
+            source: src,
+            program: &program,
+            membership: &mem,
+            projection: zone.projection,
+        }];
+
+        let far = Shard::new(1, 2, 8).unwrap();
+        let mut r = Renderer::new();
+        let mut out = vec![Rgb::BLACK; far.len() as usize];
+        let report = r.render_shard(
+            0,
+            Q16::ZERO,
+            &dev,
+            &stack,
+            &bound,
+            &mut NoUniforms,
+            &mut out,
+            far,
+        );
+
+        assert!(report.rendered.is_empty());
+        assert_eq!(report.spent, 0, "the frame section ran for no pixels");
+        assert_eq!(r.tracked(), 0, "and no machine was built for it either");
+        assert!(out.iter().all(|p| *p == Rgb::BLACK));
+    }
+
+    #[test]
+    fn an_output_slice_shorter_than_the_shard_renders_what_fits() {
+        // A mis-sized buffer costs pixels, not the device. Sixty times a second
+        // is the wrong cadence for a panic.
+        let (dev, zone, mem, stack, src, bytes) = one_source_over(8);
+        let program = Program::parse(&bytes).unwrap();
+        let bound = [Bound {
+            source: src,
+            program: &program,
+            membership: &mem,
+            projection: zone.projection,
+        }];
+        let mut r = Renderer::new();
+        let mut out = vec![Rgb::BLACK; 3];
+        let report = r.render_shard(
+            0,
+            Q16::ZERO,
+            &dev,
+            &stack,
+            &bound,
+            &mut NoUniforms,
+            &mut out,
+            Shard::whole(8),
+        );
+        assert_eq!(report.rendered, vec![uuid(1)]);
+    }
+
+    #[test]
+    fn a_hoisted_frame_section_is_not_charged_the_per_pixel_budget() {
+        // Spike S4 found `07-alert` faulting every frame on real hardware and
+        // rendering nothing: its `frame` section costs more than its per-pixel
+        // budget, and the render loop was spending the one on the other.
+        //
+        // That penalises exactly the programs the VM's whole performance story
+        // asks authors to write. Hoisting work out of the pixel section is the
+        // point; an effect should not fault for doing it well.
+        let mut p = ProgramBuilder::new();
+        let one = p.constant(Q16::ONE);
+        // A frame section far dearer than the single instruction per pixel.
+        for r in 20..31u8 {
+            p.push(Section::Frame, Instruction::with_imm(OpCode::LoadK, r, one));
+            p.push(Section::Frame, Instruction::new(OpCode::Sqrt, r, r, 0));
+        }
+        p.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 20, 20, 20),
+        );
+        let bytes = p.build();
+
+        let program = Program::parse(&bytes).unwrap();
+        assert!(
+            program.section_cost(Section::Frame) > program.budget,
+            "the test program does not have the shape the bug needs"
+        );
+
+        let dev = device(4);
+        let (zone, mem) = whole_device(&dev);
+        let mut stack = SourceStack::new(100_000, 4);
+        let src = source(1, 10, None);
+        stack.push(0, src, &mut Vec::new()).unwrap();
+
+        let mut out = vec![Rgb::BLACK; 4];
+        let mut r = Renderer::new();
+        let report = r.render(
+            0,
+            Q16::ZERO,
+            &dev,
+            &stack,
+            &[Bound {
+                source: src,
+                program: &program,
+                membership: &mem,
+                projection: zone.projection,
+            }],
+            &mut NoUniforms,
+            &mut out,
+        );
+
+        assert!(report.faults.is_empty(), "{:?}", report.faults);
+        assert_eq!(report.rendered, vec![uuid(1)]);
+        assert!(out.iter().all(|p| p.r == Q16::ONE));
+        // And the frame section's cost is still reported, not lost when the
+        // limit was reset for the pixels.
+        assert!(report.spent > program.budget * 4);
     }
 
     #[test]
@@ -911,5 +1490,60 @@ mod tests {
         let (pixel, report) = render_at(3_000_000);
         assert_eq!(pixel.r, Q16::ONE);
         assert_eq!(report.rendered, vec![uuid(1)]);
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+    use crate::zones::{Led, MapQuality};
+    use alloc::vec;
+    use lumen_proto::Uuid;
+
+    fn led(index: u16) -> Led {
+        Led {
+            index,
+            world: [Q16::from_int(index as i16), Q16::ZERO, Q16::ZERO],
+            local: [Q16::ZERO; 3],
+        }
+    }
+
+    fn dev(leds: Vec<Led>) -> DeviceLeds {
+        DeviceLeds {
+            device: Uuid([1; 16]),
+            quality: MapQuality::Mapped,
+            leds,
+        }
+    }
+
+    #[test]
+    fn a_strip_in_order_is_found_by_position() {
+        let d = dev((0..8).map(led).collect());
+        for i in 0..8u16 {
+            assert_eq!(find_led(&d, i).unwrap().index, i);
+        }
+        assert!(find_led(&d, 8).is_none());
+    }
+
+    #[test]
+    fn a_device_laid_out_some_other_way_is_still_found() {
+        // The fast path is an optimisation, not an assumption. A device whose
+        // LED list is sparse or out of order must still render every LED it
+        // has - getting this wrong would drop pixels on exactly the devices
+        // nobody tests with.
+        let d = dev(vec![led(9), led(4), led(0), led(7)]);
+        for i in [0u16, 4, 7, 9] {
+            assert_eq!(find_led(&d, i).unwrap().index, i);
+        }
+        assert!(find_led(&d, 1).is_none());
+        assert!(find_led(&d, 5).is_none());
+    }
+
+    #[test]
+    fn a_position_holding_a_different_led_falls_back() {
+        // Position 1 exists but holds LED 4, so the fast path must miss and the
+        // search must find LED 1 further along.
+        let d = dev(vec![led(0), led(4), led(1)]);
+        assert_eq!(find_led(&d, 1).unwrap().index, 1);
     }
 }

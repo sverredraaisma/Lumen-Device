@@ -28,6 +28,8 @@
 //! least important thing. Admission is re-evaluated whenever the stack changes,
 //! so a source drops back in the moment something above it expires.
 
+use alloc::vec::Vec;
+
 use lumen_proto::Uuid;
 use lumen_vm::q16::Q16;
 

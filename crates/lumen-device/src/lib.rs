@@ -33,8 +33,14 @@
 //! [`Event::PeerDiscovered`] and the core does not care how it found out.
 
 #![forbid(unsafe_code)]
+// `std` only for the tests. The device core has to build for a bare-metal
+// target - that is the entire point of it being sans-IO - and nothing here
+// needs more than `alloc`.
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+use alloc::vec::Vec;
 
 pub mod audio;
 pub mod channels;
@@ -57,7 +63,7 @@ pub use keepers::{Claim, Quorum};
 pub use node::Node;
 pub use records::Reconcile;
 pub use records::{Authority, Hlc, Record, RecordType, Store};
-pub use render::{Renderer, Rgb};
+pub use render::{Renderer, Rgb, Shard};
 pub use sources::{Source, SourceStack};
 pub use sync::{Sync, SyncState};
 pub use zones::{MapQuality, Projection, Resettle, Settling, Zone};

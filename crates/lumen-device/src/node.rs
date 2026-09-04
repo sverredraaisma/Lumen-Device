@@ -19,6 +19,9 @@
 //! so W14 is a substitution rather than a redesign. Until then a mesh is trusted
 //! at the network layer, which is fine for a simulator and not fine for a room.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use lumen_proto::header::{Header, MsgType, HEADER_LEN, TAG_LEN};
 use lumen_proto::msg::{SyncReq, SyncResp, Tick, WallQuality};
 use lumen_proto::{Datagram, Payload, Uuid, Writer};
