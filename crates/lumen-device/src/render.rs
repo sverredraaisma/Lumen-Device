@@ -1119,6 +1119,11 @@ mod tests {
         use lumen_vm::vm::R_DT;
 
         let mut p = ProgramBuilder::new();
+        // Declared, because the VM supplies `dt` only to a program whose header
+        // says it reads one - that is what lets every other program keep the
+        // register. A hand-built program that forgets this reads zero, which
+        // looks exactly like the bug this test exists to catch.
+        p.reads_dt = true;
         // Emit `dt` straight out, so the rendered colour *is* the value the VM
         // held for it.
         p.push(

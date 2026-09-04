@@ -34,6 +34,13 @@ use crate::{Action, Destination, Event, Identity, Transport};
 /// buffer is stack-allocated, so the bound is what keeps it there.
 const MAX_PAYLOAD: usize = 128;
 
+/// How long an unanswered probe blocks the next one.
+///
+/// A round trip on a local network is milliseconds, so a second is generous and
+/// still fast enough that a device losing one packet is briefly rather than
+/// permanently unsynchronised.
+const PROBE_TIMEOUT_US: u64 = 1_000_000;
+
 /// A mesh participant: election, time sync, and the codec between them.
 pub struct Node {
     me: Identity,
@@ -50,6 +57,20 @@ pub struct Node {
     /// One at a time: a second request in flight would make the responses
     /// ambiguous, and the exchange is cheap enough that pipelining buys nothing.
     pending_probe_t1: Option<u64>,
+    /// When to give up on the outstanding probe and allow another.
+    ///
+    /// Without this, one lost datagram stops time sync for ever. The probe is
+    /// one-at-a-time — a second in flight makes responses ambiguous — and the
+    /// flag was cleared only by a matching answer, so a request that never
+    /// arrived, an answer that never came back, or an answer arriving after its
+    /// question had been forgotten all left the flag set and every later probe
+    /// refused.
+    ///
+    /// It is not a hypothetical. A C3 and a desktop peer exchanged 94 round
+    /// trips, lost one, and the device then sat as an unsynchronised follower
+    /// indefinitely while ticks kept arriving once a second. A lossless
+    /// simulated network never shows it.
+    probe_deadline_us: u64,
 }
 
 impl Node {
@@ -63,6 +84,7 @@ impl Node {
             boot_counter,
             master_prefix: None,
             pending_probe_t1: None,
+            probe_deadline_us: u64::MAX,
         }
     }
 
@@ -100,15 +122,29 @@ impl Node {
     }
 
     fn next_deadline_us(&self, now_us: u64) -> u64 {
+        // The outstanding probe's timeout counts: a node that only woke for the
+        // election and the resync interval would take thirty seconds to notice
+        // a lost probe, and would spend them telling anyone who asked that it
+        // was unsynchronised.
+        let probe = self.probe_deadline_us.saturating_sub(now_us);
         self.election
             .next_deadline_us(now_us)
             .min(self.sync.next_deadline_us(now_us))
+            .min(probe)
             // Never zero: a shell that honoured a zero delay would spin.
             .max(1_000)
     }
 
     fn on_timer(&mut self, now_us: u64, out: &mut Vec<Action>) {
         let before = self.is_synced();
+
+        // Give up on a probe nobody answered, so the next one may go out. A
+        // round trip on a local network is milliseconds; a second means the
+        // request or the answer is gone.
+        if now_us >= self.probe_deadline_us {
+            self.pending_probe_t1 = None;
+            self.probe_deadline_us = u64::MAX;
+        }
 
         match self.election.on_timer(now_us) {
             ElectionOutcome::Announce | ElectionOutcome::SendTick => self.send_tick(now_us, out),
@@ -221,6 +257,7 @@ impl Node {
             return;
         }
         self.pending_probe_t1 = None;
+        self.probe_deadline_us = u64::MAX;
 
         let sample = Sample {
             t1: resp.t1,
@@ -276,10 +313,11 @@ impl Node {
             return;
         };
         if self.pending_probe_t1.is_some() {
-            // One at a time.
+            // One at a time: a second in flight makes responses ambiguous.
             return;
         }
         self.pending_probe_t1 = Some(now_us);
+        self.probe_deadline_us = now_us.saturating_add(PROBE_TIMEOUT_US);
         let payload = SyncReq { t1: now_us };
         self.send(
             now_us,
@@ -617,6 +655,78 @@ mod tests {
         assert!(
             sent(&c).is_empty(),
             "a mismatched response must not advance the exchange"
+        );
+    }
+
+    #[test]
+    fn a_probe_nobody_answers_does_not_stop_every_later_one() {
+        // Found on hardware. The probe is one-at-a-time, and the flag saying one
+        // is outstanding was cleared only by a matching answer - so a single
+        // lost datagram stopped time sync for ever. A C3 and a desktop peer
+        // exchanged 94 round trips, lost one, and the device then sat as an
+        // unsynchronised follower indefinitely while ticks kept arriving once a
+        // second.
+        //
+        // A lossless simulated network never shows this, which is why it
+        // survived to reach a strip.
+        let mut leader = node(200, 2, 0);
+        let a = leader.on_event(election::FOLLOWER_TIMEOUT_US, Event::Tick);
+        let tick = sent(&a)[0].clone();
+
+        let mut follower = node(100, 3, 0);
+        let b = follower.on_event(1_000, Event::Datagram { bytes: &tick });
+        assert_eq!(sent(&b).len(), 1, "the first probe should go out");
+
+        // Nothing answers it. Time passes - with the leader still ticking, so
+        // the election cannot interfere - and the node must try again rather
+        // than wait for a response that is never coming.
+        //
+        // Counting *probes* rather than datagrams, because a follower that
+        // times out its leader stands for election and sends a TICK. An earlier
+        // version of this test counted anything sent, passed on that TICK, and
+        // went on passing with the timeout deleted.
+        let mut asked_again = false;
+        let mut now = 1_000;
+        for _ in 0..40 {
+            now += PROBE_TIMEOUT_US / 4;
+            // Keep the leader alive, so this stays a follower throughout.
+            let keep = leader.on_event(now, Event::Tick);
+            for datagram in sent(&keep) {
+                follower.on_event(now, Event::Datagram { bytes: datagram });
+            }
+            let out = follower.on_event(now, Event::Tick);
+            if sent(&out).iter().any(|d| d[2] == MsgType::SyncReq.to_u8()) {
+                asked_again = true;
+                break;
+            }
+        }
+        assert!(
+            asked_again,
+            "one lost probe silenced every later one - sync is deadlocked"
+        );
+    }
+
+    #[test]
+    fn the_timer_accounts_for_an_outstanding_probe() {
+        // A node that only woke for the election and the resync interval would
+        // take thirty seconds to notice a lost probe, and would spend them
+        // telling anyone who asked that it was unsynchronised.
+        let mut leader = node(200, 2, 0);
+        let a = leader.on_event(election::FOLLOWER_TIMEOUT_US, Event::Tick);
+        let tick = sent(&a)[0].clone();
+
+        let mut follower = node(100, 3, 0);
+        let b = follower.on_event(1_000, Event::Datagram { bytes: &tick });
+        let timer = b
+            .iter()
+            .find_map(|x| match x {
+                Action::SetTimer { in_us } => Some(*in_us),
+                _ => None,
+            })
+            .expect("every event asks to be woken again");
+        assert!(
+            timer <= PROBE_TIMEOUT_US,
+            "asked to sleep {timer} us with a probe outstanding for {PROBE_TIMEOUT_US}"
         );
     }
 
