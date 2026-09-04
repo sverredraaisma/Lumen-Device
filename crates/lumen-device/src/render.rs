@@ -271,6 +271,13 @@ fn find_led(leds: &DeviceLeds, index: u16) -> Option<&crate::zones::Led> {
 #[derive(Default)]
 pub struct Renderer {
     machines: BTreeMap<Uuid, Machine>,
+    /// `t` at the previous frame, so `dt` can be handed to the VM.
+    ///
+    /// Derived here rather than asked for, because a caller that has to supply
+    /// it is a caller that can supply zero - and zero `dt` does not fail, it
+    /// makes every trail permanent. That was the bug: the strip fills with stuck
+    /// pixels, nothing is reported, and the effect is simply wrong.
+    last_t: Option<Q16>,
     /// Per-LED history, fed back as `prev` next frame.
     ///
     /// Keyed by source as well as LED: two sources rendering the same pixel each
@@ -354,6 +361,21 @@ impl Renderer {
             spent: 0,
         };
 
+        // Seconds since the last frame, which is what makes a feedback effect
+        // rate-independent: a trail written as `pow(decay, dt * 60)` is the same
+        // length at 30 fps as at 60, and a mesh of mixed-rate devices shows one
+        // effect rather than two.
+        //
+        // Zero on the first frame, and zero across a wrap of the show clock -
+        // `t` wraps at 32 768 seconds and a negative `dt` would be worse than
+        // none. One frame that does not decay is invisible; a negative one is
+        // an effect running backwards.
+        let dt = match self.last_t {
+            Some(last) if t.0 >= last.0 => Q16(t.0 - last.0),
+            _ => Q16::ZERO,
+        };
+        self.last_t = Some(t);
+
         // Bottom to top, so a higher-priority source overwrites a lower one and
         // the last write wins. Iterating top-down instead would need a per-pixel
         // "already claimed" set, which costs more than the overdraw it saves at
@@ -380,7 +402,18 @@ impl Renderer {
                 // against the frame for a contribution nobody can see.
                 continue;
             }
-            if self.render_source(now_us, t, leds, b, uniforms, out, &mut report, alpha, shard) {
+            if self.render_source(
+                now_us,
+                t,
+                dt,
+                leds,
+                b,
+                uniforms,
+                out,
+                &mut report,
+                alpha,
+                shard,
+            ) {
                 report.rendered.push(b.source.id);
             }
         }
@@ -400,6 +433,7 @@ impl Renderer {
             self.render_source(
                 now_us,
                 t,
+                dt,
                 leds,
                 b,
                 uniforms,
@@ -419,6 +453,7 @@ impl Renderer {
         &mut self,
         _now_us: u64,
         t: Q16,
+        dt: Q16,
         leds: &DeviceLeds,
         b: &Bound<'_>,
         uniforms: &mut U,
@@ -449,7 +484,7 @@ impl Renderer {
         // `07-alert` failing this way on hardware, every frame, rendering
         // nothing at all.
         machine.set_budget(b.program.section_cost(Section::Frame).max(1));
-        if let Err(fault) = machine.run_frame_at(b.program, t, uniforms) {
+        if let Err(fault) = machine.run_frame_at(b.program, t, dt, uniforms) {
             report.faults.push(RenderFault::Program {
                 source: b.source.id,
                 fault,
@@ -1071,6 +1106,83 @@ mod tests {
             "eight pixels at {} units each reported only {eight}",
             program.budget
         );
+    }
+
+    #[test]
+    fn dt_is_the_gap_between_frames_and_not_the_clock() {
+        // `dt` used to compile to the same register as `t`, so it was the
+        // absolute show time. Nothing failed: `pow(decay, dt * 60)` saturated,
+        // every trail became permanent, and a real strip filled with stuck white
+        // pixels over about a minute. The language documents rate-independent
+        // decay as *the* way to write a feedback effect, so this was wrong in
+        // the construct people are told to reach for.
+        use lumen_vm::vm::R_DT;
+
+        let mut p = ProgramBuilder::new();
+        // Emit `dt` straight out, so the rendered colour *is* the value the VM
+        // held for it.
+        p.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, R_DT, R_DT, R_DT),
+        );
+        let bytes = p.build();
+        let program = Program::parse(&bytes).unwrap();
+
+        let dev = device(2);
+        let (zone, mem) = whole_device(&dev);
+        let mut stack = SourceStack::new(100_000, 4);
+        let src = source(1, 10, None);
+        stack.push(0, src, &mut Vec::new()).unwrap();
+        let bound = [Bound {
+            source: src,
+            program: &program,
+            membership: &mem,
+            projection: zone.projection,
+        }];
+
+        let mut r = Renderer::new();
+        let mut out = vec![Rgb::BLACK; 2];
+
+        // First frame: nothing to measure from, so zero. One frame that does
+        // not decay is invisible; a guess would not be.
+        r.render(
+            0,
+            Q16::from_int(100),
+            &dev,
+            &stack,
+            &bound,
+            &mut NoUniforms,
+            &mut out,
+        );
+        assert_eq!(out[0].r, Q16::ZERO);
+
+        // A frame later. `t` is 100.5 s into the show and `dt` is half a second:
+        // the gap, not the clock.
+        let half_later = Q16(Q16::from_int(100).0 + Q16::HALF.0);
+        r.render(
+            0,
+            half_later,
+            &dev,
+            &stack,
+            &bound,
+            &mut NoUniforms,
+            &mut out,
+        );
+        assert_eq!(out[0].r, Q16::HALF);
+
+        // And across a wrap of the show clock, zero rather than an enormous
+        // negative - an effect that ran backwards for one frame would be a
+        // visible glitch every nine hours.
+        r.render(
+            0,
+            Q16::from_int(1),
+            &dev,
+            &stack,
+            &bound,
+            &mut NoUniforms,
+            &mut out,
+        );
+        assert_eq!(out[0].r, Q16::ZERO);
     }
 
     #[test]
