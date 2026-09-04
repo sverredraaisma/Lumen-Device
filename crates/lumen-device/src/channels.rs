@@ -35,7 +35,9 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
+use lumen_vm::vm::Uniforms;
 
 /// A producer, identified by the prefix that appears in a datagram header.
 pub type ProducerId = [u8; 4];
@@ -324,6 +326,67 @@ impl Channels {
             }
         }
         freed
+    }
+}
+
+/// The device's channels, seen as a program's uniforms.
+///
+/// `CHREAD` names a **slot**, not a channel id: the program says "my third
+/// channel" and its header says which channel that is, so the same bytecode can
+/// be pointed at a different producer without recompiling. This is the piece
+/// that resolves one into the other, and without it every channel read returns
+/// zero — which is not a failure anyone would notice, because zero is also what
+/// a channel with no producer correctly returns.
+///
+/// # Time is fixed for the frame
+///
+/// `now_us` is captured when this is built rather than read per access, so every
+/// pixel of a frame sees the same channel values. Reading the clock per access
+/// would let a channel go stale *between two pixels* of one frame, and a strip
+/// where the first half heard the beat and the second half did not is a very
+/// confusing bug to be handed.
+pub struct ChannelUniforms<'a> {
+    channels: &'a Channels,
+    program: &'a Program<'a>,
+    now_us: u64,
+}
+
+impl<'a> ChannelUniforms<'a> {
+    pub fn new(channels: &'a Channels, program: &'a Program<'a>, now_us: u64) -> Self {
+        ChannelUniforms {
+            channels,
+            program,
+            now_us,
+        }
+    }
+}
+
+impl Uniforms for ChannelUniforms<'_> {
+    fn channel(&self, slot: u8, offset: u8) -> Q16 {
+        // Every miss here returns zero rather than failing: a slot the program
+        // does not declare, a channel this device has never been told about, a
+        // producer that stopped. **Defined degradation** — a dead audio
+        // publisher leaves the lights doing something sensible instead of
+        // stopping the show.
+        let Some(id) = self.program.channel_id(slot) else {
+            return Q16::ZERO;
+        };
+        let Some(channel) = self.channels.get(id) else {
+            return Q16::ZERO;
+        };
+        // Multi-value channels — audio bands, a sensor with several readings —
+        // are consecutive ids from the declared one, so an effect reads
+        // `audio[3]` as an offset and the wire carries one channel per band.
+        if offset == 0 {
+            return channel.read(self.now_us);
+        }
+        match id
+            .checked_add(offset as u16)
+            .and_then(|at| self.channels.get(at))
+        {
+            Some(band) => band.read(self.now_us),
+            None => Q16::ZERO,
+        }
     }
 }
 
@@ -618,5 +681,136 @@ mod tests {
         assert_eq!(c.claim(1_100_000, MIC, 10, 1_000), ClaimOutcome::Taken);
         assert!(c.publish(1_100_000, MIC, 1, Q16::from_ratio(1, 4)));
         assert_eq!(c.read(1_100_000), Q16::from_ratio(1, 4));
+    }
+}
+
+#[cfg(test)]
+mod uniform_tests {
+    use super::*;
+    use lumen_vm::isa::{Instruction, OpCode};
+    use lumen_vm::program::builder::ProgramBuilder;
+    use lumen_vm::program::{Program, Section};
+
+    const ME: ProducerId = [1, 2, 3, 4];
+
+    /// A program reading channel `id` at `offset` and emitting it as red.
+    fn reads(id: u16, offset: u8) -> alloc::vec::Vec<u8> {
+        let mut b = ProgramBuilder::new();
+        let slot = b.channel(id);
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::ChRead, 20, slot, offset),
+        );
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 20, 20, 20),
+        );
+        b.build()
+    }
+
+    fn value_seen(bytes: &[u8], channels: &Channels, now_us: u64) -> Q16 {
+        let program = Program::parse(bytes).expect("a program");
+        let u = ChannelUniforms::new(channels, &program, now_us);
+        u.channel(0, 0)
+    }
+
+    #[test]
+    fn a_slot_resolves_through_the_programs_own_table() {
+        // The whole point of the indirection: the program says "my first
+        // channel", its header says that is channel 7, and the device looks up
+        // 7. Get this wrong and every effect reads somebody else's data.
+        let bytes = reads(7, 0);
+        let mut channels = Channels::new();
+        let mut ch = Channel::new(7, 1_000, Q16::ZERO);
+        assert_eq!(ch.claim(0, ME, 10, 60_000), ClaimOutcome::Taken);
+        assert!(ch.publish(0, ME, 1, Q16::HALF));
+        channels.declare(ch);
+
+        assert_eq!(value_seen(&bytes, &channels, 0), Q16::HALF);
+    }
+
+    #[test]
+    fn a_channel_this_device_has_never_heard_of_reads_zero() {
+        // Defined degradation, and the reason this bridge needs a test at all:
+        // the failure is silent. A missing bridge, a missing channel and a
+        // channel legitimately sitting at zero all look identical on a strip.
+        let bytes = reads(7, 0);
+        let empty = Channels::new();
+        assert_eq!(value_seen(&bytes, &empty, 0), Q16::ZERO);
+    }
+
+    #[test]
+    fn a_slot_the_program_does_not_declare_reads_zero() {
+        let bytes = reads(7, 0);
+        let program = Program::parse(&bytes).expect("a program");
+        let channels = Channels::new();
+        let u = ChannelUniforms::new(&channels, &program, 0);
+        // Slot 1 exists in the instruction encoding but not in this program.
+        assert_eq!(u.channel(1, 0), Q16::ZERO);
+        assert_eq!(u.channel(200, 0), Q16::ZERO);
+    }
+
+    #[test]
+    fn a_producer_that_stopped_falls_back_to_the_channels_default() {
+        // A dead publisher must leave the lights doing something sensible
+        // rather than stop the program - the value goes stale and the default
+        // takes over, and the effect never learns that anything happened.
+        let bytes = reads(7, 0);
+        let mut channels = Channels::new();
+        let mut ch = Channel::new(7, 200, Q16::from_ratio(1, 4));
+        ch.claim(0, ME, 10, 60_000);
+        ch.publish(0, ME, 1, Q16::ONE);
+        channels.declare(ch);
+
+        assert_eq!(value_seen(&bytes, &channels, 100_000), Q16::ONE);
+        // 200 ms of hold, then the default.
+        assert_eq!(
+            value_seen(&bytes, &channels, 500_000),
+            Q16::from_ratio(1, 4)
+        );
+    }
+
+    #[test]
+    fn an_offset_reads_the_next_channel_along() {
+        // Multi-value channels - audio bands, a sensor with several readings -
+        // are consecutive ids from the declared one, so one effect can read
+        // `audio[3]` while the wire carries one channel per band.
+        let bytes = reads(7, 0);
+        let mut channels = Channels::new();
+        for (id, v) in [(7u16, Q16::ZERO), (8, Q16::HALF), (9, Q16::ONE)] {
+            let mut ch = Channel::new(id, 1_000, Q16::ZERO);
+            ch.claim(0, ME, 10, 60_000);
+            ch.publish(0, ME, 1, v);
+            channels.declare(ch);
+        }
+        let program = Program::parse(&bytes).expect("a program");
+        let u = ChannelUniforms::new(&channels, &program, 0);
+        assert_eq!(u.channel(0, 1), Q16::HALF);
+        assert_eq!(u.channel(0, 2), Q16::ONE);
+        // Past the end of what was declared, zero rather than a wrap onto
+        // whatever channel happens to live there.
+        assert_eq!(u.channel(0, 3), Q16::ZERO);
+        assert_eq!(u.channel(0, 255), Q16::ZERO);
+    }
+
+    #[test]
+    fn every_pixel_of_a_frame_sees_the_same_value() {
+        // Time is captured once when the uniforms are built. Reading the clock
+        // per access would let a channel go stale between two pixels of one
+        // frame, and a strip whose first half heard the beat and whose second
+        // half did not is a memorably confusing bug.
+        let bytes = reads(7, 0);
+        let mut channels = Channels::new();
+        let mut ch = Channel::new(7, 100, Q16::ZERO);
+        ch.claim(0, ME, 10, 60_000);
+        ch.publish(0, ME, 1, Q16::ONE);
+        channels.declare(ch);
+
+        let program = Program::parse(&bytes).expect("a program");
+        let at_the_edge = ChannelUniforms::new(&channels, &program, 99_000);
+        let first = at_the_edge.channel(0, 0);
+        for _ in 0..300 {
+            assert_eq!(at_the_edge.channel(0, 0), first);
+        }
     }
 }
